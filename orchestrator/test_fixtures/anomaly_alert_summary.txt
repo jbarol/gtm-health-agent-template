@@ -1,0 +1,4 @@
+:rotating_light: *[P2]* Partner-channel win rate dropped to 8% (benchmark: 20-30%)
+*Recommended:* Pause partner intake until training resumes; brief Sarah at Acme.
+
+_Reply `expand:` in this thread for the full analysis._

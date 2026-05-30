@@ -1,0 +1,14 @@
+{
+  "include": ["orchestrator", "agents", "bin", "scripts"],
+  "extraPaths": ["orchestrator"],
+  "venvPath": ".",
+  "pythonVersion": "3.12",
+  "reportMissingImports": "error",
+  "exclude": ["**/__pycache__", "**/.pytest_cache", "**/.ruff_cache"],
+  "executionEnvironments": [
+    {
+      "root": "orchestrator",
+      "extraPaths": ["orchestrator"]
+    }
+  ]
+}

@@ -1,0 +1,103 @@
+display_information:
+  name: GTM Health Agent
+  description: Autonomous GTM operations analyst for PE portfolio companies.
+  background_color: "#1f2937"
+  long_description: |
+    GTM Health Agent is an autonomous operations analyst built on Anthropic's
+    Managed Agents API. It monitors pipeline health, sales process velocity,
+    and customer retention across portfolio companies, surfacing validated
+    findings into per-portco Slack channels. Investigations are adversarially
+    reviewed and statistically validated before any data is posted.
+
+features:
+  bot_user:
+    display_name: GTM Health Agent
+    always_online: true
+
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+
+  slash_commands:
+    - command: /bot-token-cost
+      description: "Show GTM agent spend. Args: [scope] [window] (today|week|month [portco], or 'reconcile')."
+      usage_hint: "[today|week|month] [portco] | reconcile"
+      should_escape: false
+    - command: /bot-feedback
+      description: "View aggregated user feedback on agent responses for this portco."
+      usage_hint: "[window]"
+      should_escape: false
+    - command: /bot-verbosity
+      description: "Set default response verbosity (terse|normal|verbose) for this channel."
+      usage_hint: "terse|normal|verbose"
+      should_escape: false
+    - command: /bot-refresh-surface
+      description: "Force-refresh this channel's portco health surface (Canvas)."
+      should_escape: false
+    - command: /bot-pin
+      description: "Admin - pin an agent to a specific version on next session."
+      usage_hint: "<agent> <version>"
+      should_escape: false
+    - command: /bot-stop
+      description: "Stop the running investigation in this thread (admin or author)."
+      usage_hint: "[thread_ts]"
+      should_escape: false
+    - command: /bot-flag
+      description: "Admin - flip in-process feature flags from Slack."
+      usage_hint: "<NAME> <value>"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - assistant:write
+      - canvases:read
+      - canvases:write
+      - channels:history
+      - channels:manage
+      - channels:read
+      - channels:write.topic
+      - chat:write
+      - chat:write.customize
+      - chat:write.public
+      - commands
+      - files:read
+      - files:write
+      - groups:history
+      - groups:read
+      - groups:write
+      - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - pins:read
+      - pins:write
+      - reactions:read
+      - reactions:write
+      - users:read
+      - users:read.email
+    user:
+      - channels:history
+      - chat:write
+      - groups:history
+      - search:read.public
+      - users:read
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+      - reaction_added
+      - message.channels
+      - message.groups
+      - member_joined_channel
+
+  interactivity:
+    is_enabled: true
+
+  socket_mode_enabled: true
+  token_rotation_enabled: false
+  org_deploy_enabled: false

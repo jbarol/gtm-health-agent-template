@@ -1,0 +1,20 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+/tmp/
+
+# Claude Code session state
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+
+# Local-only working artifacts (not deliverables)
+/NOT-DONE-*.md
+/decks/
+
+# Per-deployment portco config — copy portco_config.example.json -> portco_config.json
+/portco_config.json
+
+# Phase 1 scrub: real portco/vendor/operator names live here; gitignored.
+# See bin/scrub-portco-names.yml.example for the schema and onboarding.
+bin/scrub-portco-names.yml

@@ -1,0 +1,45 @@
+-- Plan #44 Task #18 — Allow ``archived`` as an investigations.status value.
+--
+-- Background: the 30-day container checkpoint TTL on Anthropic side means
+-- /mnt/session/outputs/ disappears once an investigation is idle beyond
+-- the cap. Investigations sitting in the queue for >25 days are not
+-- recoverable — the supporting files are gone. The recovery loop in
+-- ``recover_interrupted_investigations`` now marks them ``archived``
+-- instead of attempting (and silently failing) to resume.
+--
+-- The investigations table uses TEXT for status (no enum/check constraint
+-- today — see db_adapter.ensure_schema), so allowing a new value requires
+-- no DDL change. This migration exists as a marker so:
+--   1. Operators reading the migration log understand when ``archived``
+--      first appears in the data.
+--   2. If a future migration tightens the column to an enum/check, the
+--      enum builder reads the allowed-values list from this file.
+--
+-- Idempotent — re-running is a no-op.
+
+-- Recordkeeping comment only; no DDL change required at this revision.
+-- A subsequent migration that adds a CHECK constraint MUST include
+-- 'archived' alongside the existing values
+-- ('queued', 'running', 'recovering', 'interrupted', 'completed', 'failed').
+
+-- If a future hardening pass introduces a check constraint, the equivalent
+-- DDL would be:
+--
+--   ALTER TABLE investigations
+--       DROP CONSTRAINT IF EXISTS investigations_status_check;
+--   ALTER TABLE investigations
+--       ADD CONSTRAINT investigations_status_check CHECK (
+--           status IN (
+--               'queued',
+--               'running',
+--               'recovering',
+--               'interrupted',
+--               'completed',
+--               'failed',
+--               'archived'
+--           )
+--       );
+--
+-- Today the column accepts any TEXT, so writing 'archived' is already
+-- legal and this file is documentation only.
+SELECT 1;

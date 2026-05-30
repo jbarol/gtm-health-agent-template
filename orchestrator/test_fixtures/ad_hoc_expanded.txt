@@ -1,0 +1,18 @@
+*Win rate down 4.2pp this quarter*
+
+*Key metrics:*
+*Win rate* — 23.4% (prior: 27.6%, benchmark: 20-30%, ⬇)
+*Pipeline coverage* — 3.1x (prior: 3.8x, benchmark: 3-4x, ⬇)
+
+*Findings:*
+:rotating_light: *[P2]* *Partner channel win rate collapsed* — 8% (n=42) `[HIGH]`
+  _query: `SELECT Win/Loss FROM Opportunity WHERE LeadSource=Partner`_
+:eyes: *[P2]* *Cycle time elongating in negotiation stage* — 47d (P75) `[MEDIUM]` _(n=23 may be small)_
+
+*Cross-domain pattern:* Partner onboarding gap leads to lower win rate AND higher churn risk
+
+*Open questions:*
+- Why did partner training stop?
+- Are the 3 new partners net-new logos or referrals?
+
+_Methodology: Win rate = CW/(CW+CL), New Business RecordType only, CloseDate within Q1 2026_

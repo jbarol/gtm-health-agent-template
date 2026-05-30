@@ -1,0 +1,126 @@
+name: Verify agent versions
+
+# Plan #41 — CI guardrail. Compares every agent's live active version
+# on Anthropic to the pin in ``agents/active_versions.json`` and fails
+# the job on any drift. Catches the 2026-05-11 prompt-deploy-gap class
+# of incident before the next session reproduces the bug on a stale
+# prompt.
+
+on:
+  pull_request:
+    paths:
+      - 'agents/active_versions.json'
+      - 'agents/update_prompts.py'
+      - 'agents/setup_agents.py'
+      - 'agents/verify_active_versions.py'
+      - '.github/workflows/verify-agent-versions.yml'
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-agent-versions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify-agent-versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Plan #41 / PR #98 codex P2 — thread every *_AGENT_ID secret used by
+      # the AGENTS dict in update_prompts.py so the verifier never silently
+      # skips an agent. Today only WRITING_AGENT_ID is env-resolved (the
+      # other 10 are hard-coded), but threading all of them here is cheap
+      # defense-in-depth: a future agent rotation that switches a hard-coded
+      # ID over to an env var lands without a parallel workflow change.
+      COORDINATOR_ID: ${{ secrets.COORDINATOR_ID }}
+      QUICK_ANSWER_ID: ${{ secrets.QUICK_ANSWER_ID }}
+      DREAM_AGENT_ID: ${{ secrets.DREAM_AGENT_ID }}
+      PIPELINE_MONITOR_ID: ${{ secrets.PIPELINE_MONITOR_ID }}
+      SALES_MONITOR_ID: ${{ secrets.SALES_MONITOR_ID }}
+      POSTSALES_MONITOR_ID: ${{ secrets.POSTSALES_MONITOR_ID }}
+      STATISTICIAN_ID: ${{ secrets.STATISTICIAN_ID }}
+      CHART_DESIGNER_ID: ${{ secrets.CHART_DESIGNER_ID }}
+      ADVERSARIAL_REVIEWER_ID: ${{ secrets.ADVERSARIAL_REVIEWER_ID }}
+      CROSS_DOMAIN_SYNTHESIZER_ID: ${{ secrets.CROSS_DOMAIN_SYNTHESIZER_ID }}
+      WRITING_AGENT_ID: ${{ secrets.WRITING_AGENT_ID }}
+      # Plan #44 Task #1 / decision row #26 — Prompt Engineer entered the
+      # CI deploy path; the verifier now compares its pinned version to
+      # live state alongside the other 11 agents. When the secret is
+      # unset the verifier returns the same "verification cannot run"
+      # error it already returns for WRITING_AGENT_ID (loud fail, not
+      # silent skip — see verify_active_versions.py).
+      PROMPT_ENGINEER_ID: ${{ secrets.PROMPT_ENGINEER_ID }}
+      # Plan #52 PR-F — RFP Reviewer + RFP Responder entered the CI deploy
+      # path. When their secrets are unset the verifier returns the same
+      # "verification cannot run" error it returns for any env-resolved
+      # agent whose ID is missing.
+      RFP_REVIEWER_ID: ${{ secrets.RFP_REVIEWER_ID }}
+      RFP_RESPONDER_ID: ${{ secrets.RFP_RESPONDER_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # A fresh fork ships agents/active_versions.json = {} ("latest mode":
+      # every session resolves to each agent's latest version, so there is
+      # nothing to verify and NO secret is required). Detect that up front and
+      # skip the rest of the job — green — so the template does not ship a
+      # workflow that fails until the fork populates pins AND the secrets below.
+      - name: Detect latest-mode (empty pin file)
+        id: pins
+        run: |
+          content="$(tr -d '[:space:]' < agents/active_versions.json 2>/dev/null || true)"
+          if [ -z "$content" ] || [ "$content" = "{}" ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::active_versions.json is empty ({}) — latest-version mode. Nothing to verify; skipping (no secrets required)."
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.pins.outputs.empty != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: steps.pins.outputs.empty != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install anthropic
+
+      - name: Verify required secret
+        if: steps.pins.outputs.empty != 'true'
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::Missing required GitHub secret: ANTHROPIC_API_KEY"
+            exit 1
+          fi
+          # WRITING_AGENT_ID is the one *_AGENT_ID that's env-resolved in
+          # AGENTS. Without it, verify_active_versions.py would now FAIL
+          # (no longer silently skip) because the pin file tracks the
+          # writing agent's version.
+          if [ -z "${WRITING_AGENT_ID:-}" ]; then
+            echo "::error::Missing required GitHub secret: WRITING_AGENT_ID. Without it, writing_agent version cannot be verified."
+            exit 1
+          fi
+
+      - name: Synthesize minimal .env
+        if: steps.pins.outputs.empty != 'true'
+        # update_prompts.py (imported by verify_active_versions.py) reads
+        # ../.env at import time. CI doesn't ship one — write a minimal
+        # one with just the API key. *_AGENT_ID env vars are passed
+        # through the job's env: block above and read by update_prompts
+        # via os.environ.get(...).
+        run: |
+          echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" > .env
+
+      - name: Verify active versions match pin file
+        if: steps.pins.outputs.empty != 'true'
+        run: python agents/verify_active_versions.py

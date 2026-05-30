@@ -1,0 +1,47 @@
+version: 1
+description: |
+  EXAMPLE companion catalog for bin/scrub-portco-patterns.yml. Documents the
+  shape of bin/scrub-portco-names.yml without naming any real entity. After
+  forking this OSS project, copy this file to bin/scrub-portco-names.yml
+  (gitignored) and replace the synthetic names with your own portfolio
+  company list, vendor relationships, and operator identifiers.
+
+  The scrub runner loads this file at test time and bin/scrub-portco-names.yml
+  at runtime. Both share the same schema.
+
+categories:
+  portco_names:
+    severity: HIGH
+    description: |
+      Names of portfolio companies your installation knows about. Use
+      word-boundary-anchored regexes; case-sensitive variants are encouraged
+      for short or generic-sounding names to reduce false positives.
+    patterns:
+      - name: acme_corp
+        regex: '\b[Aa]cme\s*[Cc]orp\b|\bacme[-_]corp\b'
+      - name: delta_inc
+        regex: '\b[Dd]elta\s*[Ii]nc\b'
+      - name: example_one
+        regex: '\b[Ee]xample[\s_-]?[Oo]ne\b'
+
+  vendor_names:
+    severity: HIGH
+    description: |
+      Third-party vendors your installation has paid or contracted relationships
+      with that should not ship in the public archive.
+    patterns:
+      - name: vendor_x
+        regex: '\b[Vv]endor[\s_-]?[Xx]\b'
+      - name: data_provider_y
+        regex: '\b[Dd]ata\s*[Pp]rovider\s*[Yy]\b'
+
+  private_identifiers:
+    severity: HIGH
+    description: |
+      Specific email addresses, deployment URLs, and instance hostnames tied
+      to the operator's own account that must not appear in the public flip.
+    patterns:
+      - name: any_operator_email
+        regex: '\b[A-Za-z0-9._%+-]+@example\.com\b'
+      - name: production_url
+        regex: '\bexample-production\.example\.com\b'

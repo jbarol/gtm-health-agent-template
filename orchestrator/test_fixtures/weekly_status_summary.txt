@@ -1,0 +1,7 @@
+*Weekly trajectory: 4 portcos green, 2 yellow, 0 red*
+:eyes: *[P2]* *Acme*: Pipeline coverage 3.1x, below target 4x
+:rotating_light: *[P2]* *Beta*: GRR 78% — below $5-20M benchmark
+
+*Trajectory:* Pipeline coverage softening across portfolio. Partner-channel issues at Acme spreading to Acme.
+
+_Reply `expand:` in this thread for the full analysis._

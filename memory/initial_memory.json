@@ -1,0 +1,45 @@
+{
+  "portcos": {
+    "acme": {
+      "name": "Acme",
+      "sf_instance_url": "",
+      "arr_tier": "unknown",
+      "arr_basis": "unknown",
+      "schema_cache": null,
+      "tracked_metrics": {},
+      "open_questions": [
+        {
+          "id": "q-001",
+          "question": "Why is the MQL rate high but the SQL rate low? What is happening at the MQL→SQL handoff?",
+          "domain": "pipeline",
+          "priority": "must_investigate",
+          "created_date": "2026-05-06",
+          "source": "user_initial",
+          "context": "User-identified priority. Need to trace individual leads through funnel stages to identify good vs bad leads."
+        },
+        {
+          "id": "q-002",
+          "question": "What are the root causes for the lack of outbound meetings being set?",
+          "domain": "sales_process",
+          "priority": "must_investigate",
+          "created_date": "2026-05-06",
+          "source": "user_initial",
+          "context": "User-identified priority. Need to distinguish volume problem from effectiveness problem."
+        },
+        {
+          "id": "q-003",
+          "question": "What does the overall data quality look like? Are there systemic gaps that would affect analysis reliability?",
+          "domain": "cross_domain",
+          "priority": "should_investigate",
+          "created_date": "2026-05-06",
+          "source": "system_initial",
+          "context": "First run — need baseline data quality assessment before trusting any metrics."
+        }
+      ],
+      "resolved": [],
+      "active_findings": [],
+      "last_dream_run": null,
+      "last_investigation_run": null
+    }
+  }
+}

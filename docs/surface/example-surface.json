@@ -1,0 +1,129 @@
+{
+  "portco": "Acme",
+  "generated_at": "2026-05-11T14:23:00-07:00",
+  "key_metrics": [
+    {
+      "name": "Win rate (new biz, Q1)",
+      "value": "24.1%",
+      "delta_vs_prior": "-8.4pp",
+      "status": "investigating",
+      "as_of": "2026-05-11"
+    },
+    {
+      "name": "GRR",
+      "value": "87.2%",
+      "delta_vs_prior": "-1.9pp",
+      "status": "monitor",
+      "as_of": "2026-05-11"
+    },
+    {
+      "name": "Pipeline coverage (Q2)",
+      "value": "2.1x",
+      "delta_vs_prior": "-0.3x",
+      "status": "open",
+      "as_of": "2026-05-11"
+    },
+    {
+      "name": "MQL to SQL",
+      "value": "18%",
+      "delta_vs_prior": "+2pp",
+      "status": "monitor",
+      "as_of": "2026-05-11"
+    },
+    {
+      "name": "Outbound meetings/rep/wk",
+      "value": "4.2",
+      "delta_vs_prior": "-1.6",
+      "status": "investigating",
+      "as_of": "2026-05-11"
+    }
+  ],
+  "open_findings": [
+    {
+      "title": "Win rate fell 8pp in partner channel",
+      "priority": "P1",
+      "urgency": "this_week",
+      "status": "open",
+      "first_seen": "2026-05-08",
+      "decision_required": true,
+      "decision_options": [
+        "Coach AE-East",
+        "Pause partner channel",
+        "Investigate further"
+      ],
+      "evidence": "Partner-sourced opps closed 24.1% vs 32.5% prior quarter (n=47).",
+      "confidence": "HIGH"
+    },
+    {
+      "title": "Stage 3 cycle time +12 days",
+      "priority": "P2",
+      "urgency": "this_quarter",
+      "status": "investigating",
+      "first_seen": "2026-05-05",
+      "decision_required": false,
+      "decision_options": [],
+      "evidence": "Median stage-3 duration rose from 18d to 30d over 6 weeks.",
+      "confidence": "MEDIUM"
+    },
+    {
+      "title": "Q1 vertical mix shift",
+      "priority": "P3",
+      "urgency": "monitor",
+      "status": "monitor",
+      "first_seen": "2026-05-01",
+      "decision_required": false,
+      "decision_options": [],
+      "evidence": "Healthcare share of pipeline up 6pp; fintech down 4pp.",
+      "confidence": "MEDIUM"
+    }
+  ],
+  "recent_decisions": [
+    {
+      "title": "MQL to SQL drop in partner-sourced",
+      "decided_at": "2026-05-04",
+      "decision": "acted",
+      "portco_response": "Coaching cycle launched for partner-channel AEs."
+    },
+    {
+      "title": "Account expansion velocity below benchmark",
+      "decided_at": "2026-05-03",
+      "decision": "ignored",
+      "portco_response": "Partner declined; expected given Q4 expansion already pulled forward."
+    },
+    {
+      "title": "ARR computation off by 4%",
+      "decided_at": "2026-05-07",
+      "decision": "corrected",
+      "portco_response": "Schema cache fixed; downstream metrics recomputed."
+    }
+  ],
+  "trajectory": {
+    "improving": ["MQL to SQL conversion (+2pp over 4 weeks)"],
+    "worsening": [
+      "Win rate (partner channel)",
+      "GRR (regional concentration in West)",
+      "Pipeline coverage"
+    ],
+    "new_this_week": [
+      "Q1 vertical mix shift detected",
+      "Stage-3 cycle elongation"
+    ]
+  },
+  "open_questions": [
+    {
+      "question": "Why is stage 3 elongating?",
+      "asked_at": "2026-05-09",
+      "context": "Needs Sales specialist deep-dive."
+    },
+    {
+      "question": "Is Western GRR a single-team problem?",
+      "asked_at": "2026-05-08",
+      "context": "Cross-Domain Synthesizer pattern-match pending."
+    },
+    {
+      "question": "What changed in partner channel Q1?",
+      "asked_at": "2026-05-08",
+      "context": "Marketing handoff investigation queued."
+    }
+  ]
+}

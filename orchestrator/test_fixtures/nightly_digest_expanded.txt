@@ -1,0 +1,9 @@
+*Overnight: 2 portcos need attention*
+
+*Action needed:* Acme, Acme
+
+*Overnight changes:*
+:eyes: *[P2]* *GRR dropped 1.2pp at Acme* — 84.3% (was 85.5%) `[HIGH]`
+:information_source: *[P2]* *Acme new $250K opp from outbound* — $250K `[HIGH]`
+
+_Full report: https://outputs.example/report-2026-05-11_

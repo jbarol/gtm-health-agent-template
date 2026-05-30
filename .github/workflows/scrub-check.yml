@@ -1,0 +1,75 @@
+name: scrub-portco-check
+
+# Pre-public-flip gate for the OSS distribution. Runs the scrub catalog and
+# fails when any HIGH-severity portco identifier remains. Phase 6 of the
+# OSS-distribution design doc turns this on for every PR and push; until
+# then it runs only on workflow_dispatch so the in-progress scrub doesn't
+# drown the rest of CI.
+#
+# Security notes (per repo policy):
+#   - No user-controlled GitHub event inputs are interpolated into run blocks.
+#   - All inputs are committed files; no PR title/body/branch-name evaluation.
+#
+# Activation steps (when ready to flip the repo public):
+#   1. Verify `python bin/scrub-portco.py --no-names` exits 0 on `main` (shape-only).
+#   2. Materialize the private names catalog inside the workflow. Two options:
+#      (a) Add a GitHub Secret SCRUB_NAMES_YML containing the full
+#          bin/scrub-portco-names.yml content; the step below writes it.
+#      (b) Run the workflow in `--no-names` mode only and accept that
+#          literal-name leaks are caught by the local pre-merge scan instead.
+#      The committed default is option (b) because the secret approach risks
+#      printing names.yml content to logs if the workflow ever debug-dumps.
+#   3. Uncomment the `pull_request` and `push` triggers below.
+#   4. Commit the change with `BREAKING: scrub-check is now blocking`.
+
+on:
+  workflow_dispatch:
+  # pull_request:
+  # push:
+  #   branches:
+  #     - main
+
+permissions:
+  contents: read
+
+jobs:
+  scrub:
+    name: scrub-portco
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python -m pip install --no-cache-dir pyyaml
+
+      - name: Run scrub (shape-only, blocking on HIGH, redacted)
+        # NOTE: This runs WITHOUT the private names catalog (it is gitignored
+        # by design). Literal-name leaks must be caught by the maintainer's
+        # local pre-merge scan. See activation step #2 in this file's header
+        # for the secret-materialization alternative.
+        #
+        # --redact replaces matched_text with a sha256 prefix so the CI logs
+        # never persist the literal identifiers the gate is trying to remove
+        # (codex round 8 P1).
+        run: python bin/scrub-portco.py --no-names --severity HIGH --redact
+
+      - name: Emit JSON report (redacted)
+        if: always()
+        run: python bin/scrub-portco.py --no-names --json --severity HIGH --redact > scrub-report.json || true
+
+      - name: Upload scrub report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrub-report
+          path: scrub-report.json
+          retention-days: 30

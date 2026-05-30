@@ -1,0 +1,9 @@
+# Toolset snapshots — weekly drift canary
+
+Snapshots written by `bin/audit-toolset-drift.py`. Each file is named
+`<YYYY-MM-DD>.json` and contains the `tools[*]` payload retrieved from
+every agent's live state. The canary diffs each new snapshot against
+the most recent prior file and exits non-zero on drift.
+
+Snapshot retention: keep at least 4 weeks. Older snapshots can be
+deleted as the diff history accumulates.

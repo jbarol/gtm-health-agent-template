@@ -1,0 +1,84 @@
+name: CI — Prompt Preview
+
+# Plan #44 — Task #7 (decision row #23). The actual gate for prompt
+# changes; the local pre-commit hook (scripts/hooks/pre-commit) is
+# opt-in convenience that the developer can bypass with --no-verify.
+# This workflow cannot be bypassed.
+#
+# Required GitHub secret:
+#   ANTHROPIC_API_KEY — sk-ant-* key with Messages API access. The
+#     preview script uses this to run a one-shot smoke call per changed
+#     prompt and confirm the model responds coherently.
+#
+# Branch-protection setup (manual, one-time): mark "CI — Prompt
+# Preview / preview" as a required status check on `main`. The workflow
+# only registers a status check after its first run, so trigger it once
+# with a PR (or with workflow_dispatch) before flipping the protection.
+# See docs/runbooks/managed-agents-conformance.md#prompt-preview-pre-commit-hook
+
+on:
+  pull_request:
+    paths:
+      - 'agents/setup_agents.py'
+      - 'agents/update_prompts.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-prompt-preview-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: Checkout (full history so the base ref is available)
+        uses: actions/checkout@v4
+        with:
+          # The preview script diffs against the PR's base ref. Fetching
+          # the full history (or at minimum the base branch) lets
+          # `git show origin/<base>:<path>` resolve cleanly.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install anthropic
+
+      - name: Verify required secret
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::Missing required GitHub secret: ANTHROPIC_API_KEY"
+            echo "::error::This is the CI gate for prompt changes — it cannot proceed without the key. See docs/runbooks/managed-agents-conformance.md."
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY present."
+
+      - name: Run prompt preview (smoke check every changed prompt)
+        # The base ref is read from GITHUB_BASE_REF (PR runs) or
+        # defaulted to "main" (workflow_dispatch). Both are trusted
+        # GitHub-managed values — not user-controlled PR content — so
+        # no command-injection surface exists. They are still passed
+        # via the env block for hygiene.
+        #
+        # ``--strict`` converts any dynamic-string [SKIP] notice
+        # (f-string with interpolation, .format(), %-formatting, string
+        # concat) into a hard failure. The matching local hook stays
+        # informational by default — CI is the gate (Plan #44 review #2).
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          BASE="${BASE_REF:-main}"
+          echo "Diffing against origin/${BASE}"
+          python -m agents.preview_prompt --diff --strict --ref "origin/${BASE}"

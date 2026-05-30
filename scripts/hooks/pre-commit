@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run the prompt-preview smoke check on staged changes
+# to agents/setup_agents.py and agents/update_prompts.py.
+#
+# Plan #44 — Task #7 (decision row #23). This local hook is OPT-IN
+# convenience. The actual gate is the matching CI workflow
+# .github/workflows/ci-prompt-preview.yml — which mirrors the same check
+# and cannot be bypassed.
+#
+# Install with: python bin/install-hooks.py
+# Uninstall with: python bin/install-hooks.py --uninstall
+# Bypass locally (CI will still gate):  git commit --no-verify
+#
+# See docs/runbooks/managed-agents-conformance.md#prompt-preview-pre-commit-hook
+set -e
+
+# Only run when one of the prompt sources is staged. The preview engine
+# is a no-op when nothing it knows about changed, but skipping the
+# subprocess entirely keeps unrelated commits fast.
+if ! git diff --cached --name-only | grep -E '^agents/(setup_agents|update_prompts)\.py$' > /dev/null 2>&1; then
+  exit 0
+fi
+
+# Resolve the repo root so the hook works regardless of where the user
+# invoked `git commit` from inside the worktree.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# Prefer ``python3``; fall back to ``python``. The preview script targets
+# Python 3.11+ but does not import anything beyond stdlib until the smoke
+# check needs the Anthropic SDK.
+PY="$(command -v python3 || command -v python || echo python)"
+
+cd "$REPO_ROOT"
+
+if ! "$PY" -m agents.preview_prompt --diff; then
+  echo ""
+  echo "Prompt preview failed — fix the prompt or commit with --no-verify (CI will still gate)"
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,91 @@
+name: Codex Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  codex-review:
+    name: codex-review
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex@0.128.0
+
+      - name: Verify Codex CLI
+        run: codex --version
+
+      - name: Run Codex review
+        id: review
+        # Advisory only: surfaces findings as a PR comment but does not block
+        # merge. The CRITICAL: grep below still flags a workflow failure when
+        # codex returns CRITICAL findings, but the job is marked
+        # `continue-on-error` upstream so the PR check stays green either way.
+        # Reason: under honor-system enforcement and intermittent codex CLI
+        # auth/API failures, hard-gating risks blocking all merges on infra
+        # flakiness. Re-evaluate when codex CLI stabilizes.
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set +e
+          # Codex CLI requires PROMPT and --base to be mutually exclusive.
+          # We use --base (diff-against-branch mode) and rely on codex's
+          # default review behavior. Findings surface in the PR comment;
+          # the CRITICAL grep below stays in place so future codex versions
+          # that flag bugs as CRITICAL: still block merge.
+          codex review \
+            --base "$BASE_REF" \
+            -c 'model_reasoning_effort="medium"' \
+            > review.out 2>&1
+          REVIEW_EXIT=$?
+          set -e
+          echo "---codex output---"
+          cat review.out
+          echo "---end---"
+          if [ "$REVIEW_EXIT" != "0" ]; then
+            echo "::error::codex review CLI exited with $REVIEW_EXIT"
+            exit "$REVIEW_EXIT"
+          fi
+          if grep -iE "^CRITICAL:" review.out; then
+            echo "::error::Codex review surfaced CRITICAL findings"
+            exit 1
+          fi
+          echo "Codex review passed (no CRITICAL findings)."
+
+      - name: Comment review summary on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '## Codex Review\n\n';
+            if (fs.existsSync('review.out')) {
+              const review = fs.readFileSync('review.out', 'utf8').trim().slice(0, 60000);
+              body += '```\n' + review + '\n```';
+            } else {
+              body += '_(no review output captured)_';
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

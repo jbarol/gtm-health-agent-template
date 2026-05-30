@@ -1,0 +1,62 @@
+name: Upsert Slack Channel Canvas
+
+# Auto-runs `python scripts/upsert_slack_channel_canvas.py` whenever a
+# merge to main touches the canvas source-of-truth file. Also exposes a
+# manual `workflow_dispatch` trigger for re-runs (e.g. after adding a
+# new portco channel to portco_config.json).
+#
+# Required secrets:
+#   SLACK_BOT_TOKEN - xoxb-* token with canvases:read, canvases:write,
+#                     channels:read, channels:manage, groups:read scopes
+#
+# Mirrors the pattern in deploy-prompts.yml. No untrusted event payload
+# values are interpolated into run: steps.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/slack/channel-canvas.md'
+      - 'scripts/upsert_slack_channel_canvas.py'
+      - 'portco_config.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upsert-slack-canvas
+  cancel-in-progress: false
+
+jobs:
+  upsert:
+    name: upsert-slack-canvas
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'slack-sdk>=3.33.0'
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+            echo "::error::Missing required GitHub secret: SLACK_BOT_TOKEN"
+            exit 1
+          fi
+          echo "Slack bot token present."
+
+      - name: Upsert canvas to every active portco channel
+        run: python scripts/upsert_slack_channel_canvas.py

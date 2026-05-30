@@ -1,0 +1,194 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GTM Health Agent Memory",
+  "description": "Cross-session memory for the GTM health monitoring agent. Tracks metrics, findings, and open questions across weekly cycles.",
+  "type": "object",
+  "properties": {
+    "portcos": {
+      "type": "object",
+      "description": "Per-portco state, keyed by portco identifier",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "sf_instance_url": { "type": "string" },
+          "arr_tier": {
+            "type": "string",
+            "enum": ["seed_early", "growth", "scale", "expansion", "at_scale"]
+          },
+          "arr_basis": {
+            "type": "string",
+            "enum": ["ARR", "TCV", "unknown"],
+            "description": "Whether the Amount field represents ARR or TCV"
+          },
+          "schema_cache": {
+            "type": "object",
+            "description": "Cached field metadata from sf_describe to avoid re-discovery each run",
+            "properties": {
+              "last_updated": { "type": "string", "format": "date" },
+              "record_types": {
+                "type": "object",
+                "description": "Key record types discovered, e.g. {\"new_business\": \"New Business\", \"renewal\": \"Renewal\"}"
+              },
+              "key_fields": {
+                "type": "object",
+                "description": "Custom field names that vary by org, e.g. {\"arr_field\": \"ARR_Total__c\", \"tier_field\": \"Customer_Tier__c\"}"
+              },
+              "opportunity_stages": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string" },
+                    "sort_order": { "type": "integer" },
+                    "is_closed": { "type": "boolean" },
+                    "is_won": { "type": "boolean" }
+                  }
+                }
+              },
+              "lead_statuses": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string" },
+                    "sort_order": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+          "tracked_metrics": {
+            "type": "object",
+            "description": "Metrics tracked across runs",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "current_value": { "type": ["number", "null"] },
+                "prior_value": { "type": ["number", "null"] },
+                "benchmark_low": { "type": "number" },
+                "benchmark_high": { "type": "number" },
+                "unit": {
+                  "type": "string",
+                  "enum": ["percent", "ratio", "days", "count", "currency", "pp"]
+                },
+                "trend": {
+                  "type": "string",
+                  "enum": ["improving", "stable", "declining", "new"]
+                },
+                "weeks_in_trend": { "type": "integer" },
+                "history": {
+                  "type": "array",
+                  "description": "Last 12 data points (weekly snapshots)",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "date": { "type": "string", "format": "date" },
+                      "value": { "type": ["number", "null"] }
+                    }
+                  }
+                },
+                "last_updated": { "type": "string", "format": "date" }
+              }
+            }
+          },
+          "open_questions": {
+            "type": "array",
+            "description": "Questions to investigate in future runs",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "question": { "type": "string" },
+                "domain": {
+                  "type": "string",
+                  "enum": ["pipeline", "sales_process", "post_sales", "cross_domain"]
+                },
+                "priority": {
+                  "type": "string",
+                  "enum": ["must_investigate", "should_investigate", "explore_if_time"]
+                },
+                "created_date": { "type": "string", "format": "date" },
+                "source": {
+                  "type": "string",
+                  "description": "What generated this question (e.g., 'dream_2026-05-04', 'investigation_2026-05-05', 'user_slack')"
+                },
+                "context": {
+                  "type": "string",
+                  "description": "Supporting data or rationale for why this question matters"
+                }
+              },
+              "required": ["id", "question", "domain", "priority", "created_date"]
+            }
+          },
+          "resolved": {
+            "type": "array",
+            "description": "Questions that have been answered",
+            "items": {
+              "type": "object",
+              "properties": {
+                "question_id": { "type": "string" },
+                "question": { "type": "string" },
+                "answer": { "type": "string" },
+                "evidence": { "type": "string", "description": "SOQL or data that confirmed the answer" },
+                "resolved_date": { "type": "string", "format": "date" },
+                "remediation_status": {
+                  "type": "string",
+                  "enum": ["not_applicable", "recommended", "in_progress", "completed"],
+                  "description": "Whether the recommended fix has been applied"
+                }
+              },
+              "required": ["question_id", "question", "answer", "resolved_date"]
+            }
+          },
+          "active_findings": {
+            "type": "array",
+            "description": "Findings that are still relevant (not yet resolved)",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "severity": {
+                  "type": "string",
+                  "enum": ["critical", "watch", "info"]
+                },
+                "domain": { "type": "string" },
+                "summary": { "type": "string" },
+                "detail": { "type": "string" },
+                "confidence": {
+                  "type": "string",
+                  "enum": ["HIGH", "MEDIUM", "LOW"]
+                },
+                "found_date": { "type": "string", "format": "date" },
+                "last_checked": { "type": "string", "format": "date" },
+                "trend_since_found": {
+                  "type": "string",
+                  "enum": ["improving", "stable", "worsening"]
+                },
+                "remediation": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": ["data_fix", "process_change", "coaching", "strategic"]
+                    },
+                    "recommendation": { "type": "string" },
+                    "status": {
+                      "type": "string",
+                      "enum": ["recommended", "in_progress", "completed", "declined"]
+                    }
+                  }
+                }
+              },
+              "required": ["id", "severity", "domain", "summary", "found_date"]
+            }
+          },
+          "last_dream_run": { "type": ["string", "null"], "format": "date" },
+          "last_investigation_run": { "type": ["string", "null"], "format": "date" }
+        },
+        "required": ["name", "tracked_metrics", "open_questions", "resolved", "active_findings"]
+      }
+    }
+  },
+  "required": ["portcos"]
+}

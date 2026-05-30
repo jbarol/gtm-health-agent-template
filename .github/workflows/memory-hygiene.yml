@@ -1,0 +1,138 @@
+name: Memory hygiene — invalidate transient_infra entries on contract change
+
+# Plan #46 / floating-prancing-trinket PR 4. When a merge to main touches
+# a file whose underlying contract is encoded in a ``transient_infra``
+# memory entry (today: ``orchestrator/kapa_rest_tool.py``), stamp the
+# matching entries with ``superseded_at_commit: <merged_sha>``. Sessions
+# that read the stale entry afterwards are told (via the prompt rule in
+# update_prompts.py:_KAPA_KNOWLEDGE_BLOCK) to re-verify by attempting
+# the tool call rather than trusting cached infrastructure state.
+#
+# This workflow is intentionally separate from deploy-prompts.yml — the
+# trigger paths are different (contract files, not prompt files) and the
+# work is purely a git-side stamp of memory_seed/. No Anthropic API
+# credentials needed.
+#
+# Required permissions: ``contents: write`` to push the stamped file
+# back to main (same auto-commit pattern as deploy-prompts.yml).
+#
+# Security: every untrusted-shaped input (workflow_dispatch input, git
+# diff output) is read via env: rather than `${{ }}` interpolation into
+# the run block.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      # Keep this list in sync with the TOPICS dict in
+      # bin/stamp_superseded_memory.py — the workflow trigger and the
+      # script's topic registry are two halves of the same contract.
+      - 'orchestrator/kapa_rest_tool.py'
+      - 'bin/probe_kapa.py'
+      - 'bin/verify_kapa_key.sh'
+  workflow_dispatch:
+    inputs:
+      touched_files:
+        description: 'Comma-separated file paths to treat as touched (manual trigger only)'
+        required: false
+        default: 'orchestrator/kapa_rest_tool.py'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: memory-hygiene
+  cancel-in-progress: false
+
+jobs:
+  stamp:
+    name: stamp-superseded-memory
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # need HEAD~1 for the diff below
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # On push: enumerate the files actually changed by the triggering
+      # commit. On workflow_dispatch: read from the user-supplied input.
+      # The script's topic registry decides which (if any) memory entries
+      # to stamp — passing extra files is safe (they just won't match).
+      #
+      # Untrusted-shaped inputs flow via env, not ${{ }} interpolation
+      # into the run block, per GitHub workflow injection guidance.
+      - name: Compute touched files
+        id: touched
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_INPUT: ${{ inputs.touched_files }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            files="${DISPATCH_INPUT}"
+          else
+            files="$(git diff --name-only HEAD~1..HEAD | tr '\n' ',' | sed 's/,$//')"
+          fi
+          # Use GITHUB_OUTPUT delimiter format to safely handle any chars.
+          {
+            echo "files<<EOF_TOUCHED"
+            echo "${files}"
+            echo "EOF_TOUCHED"
+          } >> "$GITHUB_OUTPUT"
+          echo "Touched files: ${files}"
+
+      - name: Stamp superseded transient_infra entries
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          TOUCHED_FILES: ${{ steps.touched.outputs.files }}
+        run: |
+          set -euo pipefail
+          python bin/stamp_superseded_memory.py \
+            --touched-files "${TOUCHED_FILES}"
+
+      - name: Commit stamped memory entries
+        id: commit_stamps
+        env:
+          STAMP_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ ! -d memory_seed ] || git diff --quiet memory_seed/ 2>/dev/null; then
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            echo "No memory entries needed stamping."
+            exit 0
+          fi
+          echo "no_changes=false" >> "$GITHUB_OUTPUT"
+          git add memory_seed/
+          git commit -m "chore(memory): stamp transient_infra entries superseded by ${STAMP_SHA}"
+          if git push origin HEAD:main; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "direct push blocked — falling back to PR."
+          fi
+
+      - name: Open follow-up PR if direct push was blocked
+        if: steps.commit_stamps.outputs.no_changes == 'false' && steps.commit_stamps.outputs.pushed == 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/stamp-superseded-memory
+          title: 'chore(memory): stamp transient_infra entries superseded by deploy'
+          body: |
+            Auto-generated by `.github/workflows/memory-hygiene.yml`. The merged
+            commit touched a file whose contract is encoded in one or more
+            `transient_infra` memory entries. Stamping them with
+            `superseded_at_commit: <sha>` forces the next Managed Agent
+            session that reads the entry to re-verify by attempting the
+            relevant tool call (see `_KAPA_KNOWLEDGE_BLOCK` in
+            `agents/update_prompts.py`).
+          commit-message: 'chore(memory): stamp transient_infra entries superseded by deploy'

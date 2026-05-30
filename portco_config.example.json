@@ -1,0 +1,62 @@
+{
+  "_comment": "Copy this file to portco_config.json and fill in your own values. The real portco_config.json is gitignored. Each top-level key under 'portcos' is one portfolio company / tenant. The orchestrator resolves a Slack channel to a portco via slack_channel, then reads that portco's data_sources. Add as many portcos as you like; only 'active' ones are served.",
+  "portcos": {
+    "acme": {
+      "name": "Acme Corp",
+      "status": "active",
+      "fund": "Fund I",
+      "data_sources": {
+        "crm": {
+          "type": "salesforce",
+          "extraction": "mcp",
+          "sf_alias": "Acme",
+          "mcp_server_url": "https://api.salesforce.com/platform/mcp/v1/platform/sobject-reads",
+          "vault_id": "vlt_REPLACE_WITH_YOUR_SALESFORCE_VAULT_ID",
+          "sf_credentials": {
+            "consumer_key_env": "SF_CONSUMER_KEY_ACME",
+            "consumer_secret_env": "SF_CONSUMER_SECRET_ACME",
+            "domain_env": "SF_DOMAIN_ACME",
+            "username_env": "SF_USERNAME_ACME",
+            "password_env": "SF_PASSWORD_ACME",
+            "token_env": "SF_TOKEN_ACME"
+          }
+        },
+        "knowledge": {
+          "type": "kapa",
+          "extraction": "rest",
+          "enabled": false,
+          "tool_name": "search_knowledge_base",
+          "api_key_env": "KAPA_ACME_API_KEY",
+          "project_id_env": "KAPA_ACME_PROJECT_ID",
+          "indexed_sources_summary": "OPTIONAL internal knowledge base (Confluence / Jira / help-docs / Slack) exposed to agents via Kapa.ai. Set enabled=true and provide the KAPA_* env vars to activate. Leave enabled=false to run with no KB — the agents degrade gracefully."
+        }
+      },
+      "slack_channel": "C0000000000",
+      "team_members": [],
+      "metadata": {
+        "arr_tier": "growth",
+        "arr_basis": "ARR",
+        "gtm_motion": "sales-led",
+        "sf_org_id": "00D000000000000AAA",
+        "sf_username": "gtm-bot@your-org.example.com"
+      }
+    },
+    "delta": {
+      "name": "Delta Co (example of a portco not yet wired to a CRM)",
+      "status": "pending_crm",
+      "fund": "Fund II",
+      "data_sources": {
+        "crm": { "type": "unknown", "extraction": "pending" }
+      },
+      "slack_channel": null,
+      "team_members": [],
+      "metadata": {}
+    }
+  },
+  "master_channel": "C0000000000",
+  "admin_user_ids": ["U0000000000"],
+  "vault_ids": {
+    "salesforce_acme": "vlt_REPLACE_WITH_YOUR_SALESFORCE_VAULT_ID",
+    "slack": "vlt_REPLACE_WITH_YOUR_SLACK_VAULT_ID"
+  }
+}

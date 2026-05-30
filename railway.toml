@@ -1,0 +1,35 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# Plan #42 PR1 D4 — `/ready` is the smoke-probe-gated readiness endpoint
+# (PR2 introduces it; this file is its owner per the plan's PR-ownership
+# table). Until PR2 lands the route does not exist yet — temporarily the
+# Railway container will see /ready as 404 on a fresh boot, which causes
+# the same "keep previous image" behavior we want long-term. After PR2
+# lands the new container's /ready returns 200 only after the smoke
+# probe passes; the 90s timeout gives the probe headroom over its 60s
+# budget (D7 inconclusive-pass for Anthropic 429/503 stays inside the
+# budget, but the 30s slack is cheap insurance).
+healthcheckPath = "/ready"
+healthcheckTimeout = 90
+
+# OPERATIONAL NOTE (Plan #42 PR1 D3) -- the prod Railway service MUST
+# have auto-deploy DISABLED in the dashboard:
+#
+#   Railway -> project -> prod service -> Settings -> Source ->
+#       Auto Deploy = OFF
+#
+# Without this, pushes to main will trigger an immediate Railway build
+# AND the business-hours-gated `.github/workflows/deploy-prod.yml`,
+# racing each other. The workflow-triggered `railway up --service prod
+# --detach` is the only sanctioned deploy path; the dashboard toggle
+# is the kill switch that makes the gate enforceable.
+#
+# This is a manual step in the Railway dashboard — the toml file
+# cannot toggle Source.AutoDeploy. The runbook
+# `docs/runbook-business-hours.md` walks through it once.

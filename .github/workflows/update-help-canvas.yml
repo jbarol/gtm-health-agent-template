@@ -1,0 +1,104 @@
+name: Update Help Canvas
+
+# Auto-regenerates the "GTM Health Agent — How to Use" Slack canvas
+# whenever a merge to main touches the agent roster, slash commands,
+# or the canvas template itself. Idempotent: the renderer no-ops when
+# the content hash matches the prior version.
+#
+# Security note: this workflow consumes NO untrusted GitHub event input
+# (no issue / PR / comment / commit-message strings). The only external
+# data flowing in is Repository Secrets (SLACK_BOT_TOKEN, SLACK_CHANNEL_ID,
+# HELP_CANVAS_ID) passed via env. All ``run:`` steps operate on a
+# checked-in Python script's stdout, which we control.
+#
+# Required secrets:
+#   SLACK_BOT_TOKEN  - bot token with canvases:write +
+#                      conversations.canvases:write scopes
+#   SLACK_CHANNEL_ID - channel that hosts the canvas (first run only)
+#
+# Optional (set after first run):
+#   HELP_CANVAS_ID   - canvas_id printed by the first run; subsequent runs
+#                      use canvases.edit instead of creating a new canvas.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      # Agent roster + system prompts.
+      - 'agents/setup_agents.py'
+      - 'agents/update_prompts.py'
+      - 'agents/update_subagent_tools.py'
+      - 'agents/active_versions.json'
+      # Slash-command registration + feedback prefix list.
+      - 'orchestrator/slack_bot.py'
+      - 'orchestrator/session_runner.py'
+      # The renderer itself.
+      - 'bin/render_help_canvas.py'
+      - '.github/workflows/update-help-canvas.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-help-canvas
+  cancel-in-progress: false
+
+jobs:
+  render-and-push:
+    name: render-help-canvas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+      HELP_CANVAS_ID: ${{ secrets.HELP_CANVAS_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install slack_sdk
+        run: pip install --no-cache-dir slack_sdk
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "$SLACK_BOT_TOKEN" ]; then
+            echo "::error::Missing required GitHub secret: SLACK_BOT_TOKEN"
+            exit 1
+          fi
+          if [ -z "$SLACK_CHANNEL_ID" ] && [ -z "$HELP_CANVAS_ID" ]; then
+            echo "::error::Missing both SLACK_CHANNEL_ID and HELP_CANVAS_ID."
+            echo "::error::First run needs SLACK_CHANNEL_ID to create the canvas."
+            echo "::error::Subsequent runs need HELP_CANVAS_ID to edit it."
+            exit 1
+          fi
+
+      - name: Render + push canvas
+        id: render
+        run: |
+          set -euo pipefail
+          python bin/render_help_canvas.py | tee /tmp/render.log
+          new_id=$(grep -E '^HELP_CANVAS_ID=' /tmp/render.log | head -1 | cut -d= -f2 || true)
+          if [ -n "$new_id" ]; then
+            {
+              echo "### New canvas created"
+              echo ""
+              echo "Save this in Repository Secrets so the next run edits it:"
+              echo ""
+              echo '```'
+              echo "HELP_CANVAS_ID=$new_id"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload rendered markdown (forensics)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: help-canvas-markdown
+          path: /tmp/render.log
+          retention-days: 30

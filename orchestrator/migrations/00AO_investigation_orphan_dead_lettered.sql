@@ -1,0 +1,53 @@
+-- Task #23 — Allow ``orphan_dead_lettered`` as an investigations.status value.
+--
+-- Background: ``recover_interrupted_investigations`` retries an interrupted
+-- investigation up to MAX_RECOVERY_ATTEMPTS (2) times. Pre-Task #23 the
+-- third encounter silently terminalized via ``TERMINAL_FAILURE`` and the
+-- investigation row was marked ``failed`` — operationally indistinguishable
+-- from a one-shot crash. The orphan session ``sesn_EXAMPLE``
+-- (carry-over snapshot 2026-05-13) sat in ``running`` for days while
+-- nothing was actually working it.
+--
+-- The new policy: on the 2nd recovery failure, DM admins with the full
+-- context (session_id, thread permalink, original question, error history)
+-- and mark the row ``orphan_dead_lettered`` so analytics + /cost can
+-- distinguish "we gave up and asked a human" from "the session crashed."
+--
+-- The investigations table uses TEXT for status (no enum/check constraint
+-- today — see db_adapter.ensure_schema), so writing ``orphan_dead_lettered``
+-- is already legal at the DDL layer. This migration exists as a marker
+-- so operators reading the migration log understand when the value first
+-- appears in the data. Also keeps the allowed-values list documented for
+-- a future enum/check tightening pass.
+--
+-- Idempotent — re-running is a no-op.
+
+-- Recordkeeping comment only; no DDL change required at this revision.
+-- A subsequent migration that adds a CHECK constraint MUST include
+-- 'orphan_dead_lettered' alongside the existing values
+-- ('queued', 'running', 'recovering', 'interrupted', 'completed',
+--  'failed', 'cancelled', 'archived').
+
+-- If a future hardening pass introduces a check constraint, the equivalent
+-- DDL would be:
+--
+--   ALTER TABLE investigations
+--       DROP CONSTRAINT IF EXISTS investigations_status_check;
+--   ALTER TABLE investigations
+--       ADD CONSTRAINT investigations_status_check CHECK (
+--           status IN (
+--               'queued',
+--               'running',
+--               'recovering',
+--               'interrupted',
+--               'completed',
+--               'failed',
+--               'cancelled',
+--               'archived',
+--               'orphan_dead_lettered'
+--           )
+--       );
+--
+-- Today the column accepts any TEXT, so writing 'orphan_dead_lettered' is
+-- already legal and this file is documentation only.
+SELECT 1;

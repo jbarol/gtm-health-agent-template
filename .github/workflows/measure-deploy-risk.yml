@@ -1,0 +1,110 @@
+name: Measure deploy risk (monthly)
+
+# Plan #42 PR1 D17 -- monthly re-measurement so the "do we ship plan
+# #43" decision is data-driven. Output gets DMed to admins automatically;
+# the file is also available as an artifact for 90 days.
+#
+# Required secrets:
+#   DATABASE_URL          -- Railway Postgres URL (same one Railway uses).
+#   SLACK_BOT_TOKEN       -- xoxb-* for files_upload_v2.
+#   ANTHROPIC_API_KEY     -- not used by the script directly, but
+#                            orchestrator/config.py validates it at
+#                            import; the script imports cost_digest for
+#                            admin-id resolution, which in turn imports
+#                            slack_bot, which imports config.
+#   SLACK_APP_TOKEN, SLACK_CHANNEL_ID, *_AGENT_ID, *_STORE_ID --
+#     same defense-in-depth as deploy-prompts.yml: synthesize a .env
+#     so config.pys require_env() passes at import time. None of these
+#     are actually used at runtime by this script.
+#
+# Optional secrets:
+#   SLACK_ADMIN_USER_IDS  -- comma-separated user IDs. When unset the
+#                            script logs a warning, writes the .xlsx,
+#                            and exits 0. The artifact upload below is
+#                            the recovery path.
+
+on:
+  schedule:
+    # 0 17 1 * * UTC == 09:00 PT on the 1st of every month (PDT).
+    # Pacific Standard Time would be 10:00 PT; we accept the DST drift
+    # to keep the schedule single-line.
+    - cron: '0 17 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: measure-deploy-risk
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+      SLACK_ADMIN_USER_IDS: ${{ secrets.SLACK_ADMIN_USER_IDS }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ENVIRONMENT_ID: ${{ secrets.ENVIRONMENT_ID }}
+      DREAM_AGENT_ID: ${{ secrets.DREAM_AGENT_ID }}
+      COORDINATOR_ID: ${{ secrets.COORDINATOR_ID }}
+      QUICK_AGENT_ID: ${{ secrets.QUICK_ANSWER_ID }}
+      METHODOLOGY_STORE_ID: ${{ secrets.METHODOLOGY_STORE_ID }}
+      HEALTH_STORE_ID: ${{ secrets.HEALTH_STORE_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r orchestrator/requirements.txt
+
+      - name: Synthesize .env for config.py
+        # config.py raises at import on missing required keys. The script
+        # imports cost_digest -> slack_bot -> config. Mirror the
+        # deploy-prompts.yml pattern: write a .env with every required
+        # value so the import path succeeds. Empty optional secrets are
+        # acceptable because config.py uses require_env only on the
+        # core set.
+        run: |
+          {
+            echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
+            echo "SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}"
+            echo "SLACK_APP_TOKEN=${SLACK_APP_TOKEN}"
+            echo "SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}"
+            echo "SLACK_ADMIN_USER_IDS=${SLACK_ADMIN_USER_IDS}"
+            echo "DATABASE_URL=${DATABASE_URL}"
+            echo "ENVIRONMENT_ID=${ENVIRONMENT_ID}"
+            echo "DREAM_AGENT_ID=${DREAM_AGENT_ID}"
+            echo "COORDINATOR_ID=${COORDINATOR_ID}"
+            echo "QUICK_AGENT_ID=${QUICK_AGENT_ID}"
+            echo "METHODOLOGY_STORE_ID=${METHODOLOGY_STORE_ID}"
+            echo "HEALTH_STORE_ID=${HEALTH_STORE_ID}"
+          } > .env
+
+      - name: Run measure-deploy-risk
+        # The script exits 3 when there are no rows in the window -- that
+        # is a meaningful state (Did the ledger break?) and should remain
+        # visible. The other codes (0/1/2) follow standard conventions.
+        run: |
+          mkdir -p artifacts
+          python bin/measure-deploy-risk.py \
+              --days 60 \
+              --out "artifacts/deploy_risk_$(date -u +%Y%m%d).xlsx" \
+              --portco acme
+          rm -f .env
+
+      - name: Upload .xlsx artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-risk-monthly
+          path: artifacts/*.xlsx
+          retention-days: 90

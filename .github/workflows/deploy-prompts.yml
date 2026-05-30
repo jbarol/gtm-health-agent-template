@@ -1,0 +1,510 @@
+name: Deploy Managed-Agent Prompts
+
+# Auto-runs `python agents/update_prompts.py` whenever a merge to main
+# touches the prompt sources (agents/setup_agents.py or
+# agents/update_prompts.py). Closes the deploy gap where prompt changes
+# ship in code but never reach the live Anthropic Managed Agents — see
+# 2026-05-11 incident: PR #37 shipped a list-pull streaming pattern at
+# 14:16 PT and was never deployed; a 14:44 PT session picked up the
+# stale v20 Coordinator prompt and reproduced an earlier context blowup
+# ($47 wasted).
+#
+# Required secrets:
+#   ANTHROPIC_API_KEY — sk-ant-* key with Managed Agents write scope.
+#   WRITING_AGENT_ID — the only *_AGENT_ID that's env-resolved in
+#     update_prompts.AGENTS. Used by both the deploy step (which skips
+#     the writing agent if unset) and the inline verify gate (which
+#     would otherwise fail with a clear "missing secret" error).
+#
+# Optional but recommended (defense-in-depth — see the env: block on
+# the verify step below):
+#   COORDINATOR_ID / QUICK_ANSWER_ID / DREAM_AGENT_ID /
+#   PIPELINE_MONITOR_ID / SALES_MONITOR_ID / POSTSALES_MONITOR_ID /
+#   STATISTICIAN_ID / CHART_DESIGNER_ID / ADVERSARIAL_REVIEWER_ID /
+#   CROSS_DOMAIN_SYNTHESIZER_ID — the other 10 agent IDs are currently
+#   hardcoded in update_prompts.AGENTS, but threading the secrets here
+#   is cheap insurance against a future rotation switching one of them
+#   over to env resolution.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'agents/setup_agents.py'
+      - 'agents/update_prompts.py'
+      # Track I (Iteration 2): the Writing Agent's system prompt is
+      # the source of truth for ``PROMPTS['writing_agent']`` (loaded via
+      # ``_load_writing_agent_prompt()``), and ``update_subagent_tools.py``
+      # syncs the four pre-provisioned sub-agents' tools[]. A change to
+      # either must trigger a redeploy or the live agents drift from main.
+      - 'orchestrator/writing_agent.py'
+      - 'agents/update_subagent_tools.py'
+      # Plan #52 PR-F: RFP Reviewer + RFP Responder system prompts are
+      # imported from their provisioner files into update_prompts.PROMPTS.
+      # Changes to either provisioner must trigger a redeploy.
+      - 'agents/provision_rfp_reviewer_agent.py'
+      - 'agents/provision_rfp_agent.py'
+  workflow_dispatch:
+
+# Plan #41 — write permission needed so the workflow can commit the
+# refreshed agents/active_versions.json back to main after a successful
+# deploy. ``pull-requests: write`` lets us fall back to opening a PR
+# when branch protection blocks the direct push.
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: deploy-prompts
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy-prompts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+      ENVIRONMENT_ID: ${{ secrets.ENVIRONMENT_ID }}
+      DREAM_AGENT_ID: ${{ secrets.DREAM_AGENT_ID }}
+      COORDINATOR_ID: ${{ secrets.COORDINATOR_ID }}
+      # Plan #44 decision row #18 — Quick Answer agent ID has a historical
+      # naming clash. The repo has BOTH ``QUICK_AGENT_ID`` (canonical,
+      # read by orchestrator/config.py and printed by setup_agents.py)
+      # and ``QUICK_ANSWER_ID`` (legacy, used by the verify gate below
+      # at line 237 and by verify-agent-versions.yml). The workflow
+      # threads ``QUICK_ANSWER_ID`` so the same secret name flows
+      # through both the deploy step and the verify gate; config.py
+      # accepts either env-var name with a back-compat fallback.
+      QUICK_ANSWER_ID: ${{ secrets.QUICK_ANSWER_ID }}
+      METHODOLOGY_STORE_ID: ${{ secrets.METHODOLOGY_STORE_ID }}
+      HEALTH_STORE_ID: ${{ secrets.HEALTH_STORE_ID }}
+      WRITING_AGENT_ID: ${{ secrets.WRITING_AGENT_ID }}
+      # Plan #44 Task #1 — Prompt Engineer was previously absent from the
+      # CI deploy path; the live agent ran on whatever prompt was
+      # manually pasted into the Anthropic Console. Threading the secret
+      # here closes the gap. When unset the AGENTS dict skips the agent
+      # cleanly (same shape as WRITING_AGENT_ID pre-PR #75).
+      PROMPT_ENGINEER_ID: ${{ secrets.PROMPT_ENGINEER_ID }}
+      # The seven sub-agents whose tools[] are synced by
+      # agents/update_subagent_tools.py. IDs are pinned in
+      # update_prompts.AGENTS but we read them from env here to mirror
+      # the rotation-friendly pattern used by WRITING_AGENT_ID. The
+      # three Monitors were added 2026-05-12 - see the docstring in
+      # update_subagent_tools.py for the prompt-only-enforcement hole
+      # this closes.
+      STATISTICIAN_ID: ${{ secrets.STATISTICIAN_ID }}
+      PIPELINE_MONITOR_ID: ${{ secrets.PIPELINE_MONITOR_ID }}
+      SALES_MONITOR_ID: ${{ secrets.SALES_MONITOR_ID }}
+      POSTSALES_MONITOR_ID: ${{ secrets.POSTSALES_MONITOR_ID }}
+      ADVERSARIAL_REVIEWER_ID: ${{ secrets.ADVERSARIAL_REVIEWER_ID }}
+      CROSS_DOMAIN_SYNTHESIZER_ID: ${{ secrets.CROSS_DOMAIN_SYNTHESIZER_ID }}
+      CHART_DESIGNER_ID: ${{ secrets.CHART_DESIGNER_ID }}
+      # Plan #52 PR-F: RFP Reviewer + RFP Responder agent IDs. Both are
+      # env-resolved in update_prompts.AGENTS (same pattern as WRITING_AGENT_ID).
+      # When unset the deploy loop skips them cleanly (see the "no agent
+      # ID set" branch in update_prompts.main). PRE-MERGE BLOCKER: both
+      # secrets must be added to the GitHub repo before this workflow can
+      # push prompt updates to the live RFP agents.
+      RFP_REVIEWER_ID: ${{ secrets.RFP_REVIEWER_ID }}
+      RFP_RESPONDER_ID: ${{ secrets.RFP_RESPONDER_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install anthropic
+
+      - name: Verify required secret
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::Missing required GitHub secret: ANTHROPIC_API_KEY"
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY present."
+
+      # Plan #42 PR3 — author-verified label gate. Read the merged PR
+      # that owns the triggering commit and require at least one label
+      # named ``prompt-author-verified``. Honest naming (D10): the same
+      # dev sets and merges, so this is a tripwire for forgetfulness,
+      # NOT a security control. ``workflow_dispatch`` runs skip the gate
+      # because they're a deliberate manual action by the operator.
+      #
+      # All untrusted-shaped input is read via env: rather than `${{ }}`
+      # interpolation into the run script (see GitHub workflow injection
+      # guidance). GITHUB_SHA is set by Actions itself and is safe.
+      - name: Gate on prompt-author-verified PR label
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="${GITHUB_SHA}"
+          echo "Looking up merged PR for commit ${sha}..."
+          pr_json="$(gh pr list \
+            --search "${sha}" \
+            --state merged \
+            --json number,labels,author \
+            --limit 1)"
+          echo "PR lookup result: ${pr_json}"
+          pr_number="$(echo "${pr_json}" | jq -r '.[0].number // empty')"
+          if [ -z "${pr_number}" ]; then
+            echo "::error::No merged PR found for SHA ${sha}. Refusing"
+            echo "::error::prompt deploy — every prompt change must land via PR."
+            exit 1
+          fi
+          has_label="$(echo "${pr_json}" | jq -r \
+            '[.[0].labels[].name] | any(. == "prompt-author-verified")')"
+          if [ "${has_label}" != "true" ]; then
+            echo "::error::Refusing prompt deploy — merged PR ${pr_number}"
+            echo "::error::for SHA ${sha} does NOT carry the 'prompt-author-verified'"
+            echo "::error::label. Add the label and re-run the workflow,"
+            echo "::error::OR mark the deploy intentional via re-run-with-label."
+            exit 1
+          fi
+          echo "PR ${pr_number} has prompt-author-verified label — gate cleared."
+
+      # Plan #42 PR3 — upload PRE-deploy active_versions.json so the
+      # rollback wrapper can identify the prior versions to restore.
+      # Reading HEAD~1 of active_versions.json is unreliable because
+      # this workflow auto-commits pin updates and other commits can
+      # sit between deploys (D9). The artifact is deterministic.
+      - name: Upload pre-deploy active_versions.json (rollback target)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre_deploy_versions
+          path: agents/active_versions.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Synthesize .env for update_prompts.py
+        # update_prompts.py imports writing_agent → config.py, which
+        # require_env's every key at module load. CI must write every
+        # required key, not just ANTHROPIC_API_KEY. The Slack/agent IDs
+        # don't need to be production-valid here — config.py only checks
+        # that they are non-empty strings.
+        run: |
+          {
+            echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
+            echo "SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}"
+            echo "SLACK_APP_TOKEN=${SLACK_APP_TOKEN}"
+            echo "SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}"
+            echo "ENVIRONMENT_ID=${ENVIRONMENT_ID}"
+            echo "DREAM_AGENT_ID=${DREAM_AGENT_ID}"
+            echo "COORDINATOR_ID=${COORDINATOR_ID}"
+            # Plan #44 decision row #18 — write QUICK_ANSWER_ID (legacy
+            # secret name) into the synthesized .env. config.py reads
+            # both QUICK_AGENT_ID and QUICK_ANSWER_ID with a backward-
+            # compat fallback so either name resolves correctly.
+            echo "QUICK_ANSWER_ID=${QUICK_ANSWER_ID}"
+            echo "METHODOLOGY_STORE_ID=${METHODOLOGY_STORE_ID}"
+            echo "HEALTH_STORE_ID=${HEALTH_STORE_ID}"
+            echo "WRITING_AGENT_ID=${WRITING_AGENT_ID}"
+            echo "PROMPT_ENGINEER_ID=${PROMPT_ENGINEER_ID}"
+            echo "STATISTICIAN_ID=${STATISTICIAN_ID}"
+            echo "PIPELINE_MONITOR_ID=${PIPELINE_MONITOR_ID}"
+            echo "SALES_MONITOR_ID=${SALES_MONITOR_ID}"
+            echo "POSTSALES_MONITOR_ID=${POSTSALES_MONITOR_ID}"
+            echo "ADVERSARIAL_REVIEWER_ID=${ADVERSARIAL_REVIEWER_ID}"
+            echo "CROSS_DOMAIN_SYNTHESIZER_ID=${CROSS_DOMAIN_SYNTHESIZER_ID}"
+            echo "CHART_DESIGNER_ID=${CHART_DESIGNER_ID}"
+            # Plan #52 PR-F: RFP Reviewer + RFP Responder.
+            echo "RFP_REVIEWER_ID=${RFP_REVIEWER_ID}"
+            echo "RFP_RESPONDER_ID=${RFP_RESPONDER_ID}"
+          } > .env
+
+      - name: Deploy prompts to Managed Agents
+        run: python agents/update_prompts.py
+
+      # Plan #42 PR3 — upload POST-deploy active_versions.json. The pair
+      # ``pre_deploy_versions`` + ``post_deploy_versions`` forms the
+      # rollback target for ``bin/rollback-deploy.py``. ``update_prompts.py``
+      # writes the new pin file in-tree; capturing it here (before the
+      # auto-commit step below removes the temp .env) ensures the artifact
+      # reflects the deploy that actually landed.
+      - name: Upload post-deploy active_versions.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: post_deploy_versions
+          path: agents/active_versions.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Update sub-agent tools arrays
+        # Track I (Iteration 2): the four pre-provisioned sub-agents
+        # (Statistician / Adversarial Reviewer / Cross-Domain Synthesizer
+        # / Chart Designer) were provisioned before SUB_AGENT_DATA_TOOLS
+        # existed. Their tools[] cannot be set via setup_agents.py source
+        # because they aren't re-minted by it. This step keeps their
+        # tools[] in sync with SUB_AGENT_DATA_TOOLS on every deploy.
+        # Idempotent — skips when the live tools[] already match.
+        # Capture stdout so the gate below can detect whether
+        # republish_coordinator_multiagent actually performed an update
+        # (the only signal that's authoritative — file-name diffs alone
+        # produce false positives on cosmetic / comment-only changes).
+        run: |
+          set -euo pipefail
+          python agents/update_subagent_tools.py 2>&1 | tee /tmp/subagent_tools_output.txt
+
+      # PR 3 (floating-prancing-trinket plan, 2026-05-14) — multiagent
+      # repin gate. The intent: after ``update_subagent_tools.py`` has
+      # actually updated one or more sub-agents on Anthropic, the
+      # Coordinator's pinned sub-agent versions in
+      # ``agents/active_versions.json`` MUST be bumped in the same run —
+      # otherwise the Coordinator stays pinned at the old snapshot and
+      # production traffic dispatches to stale sub-agents (the
+      # 2026-05-11 $47 incident mechanic).
+      #
+      # Important: this gate is keyed off the SCRIPT'S RUNTIME BEHAVIOR
+      # (did the republish step run and report ``[OK] coordinator
+      # multiagent``?), NOT off ``git diff --name-only`` against
+      # ``setup_agents.py`` / ``update_subagent_tools.py``. Cosmetic /
+      # comment-only / docs-only changes to those files do not update
+      # any sub-agent and should not require a Coordinator repin
+      # (codex PR #194 review caught the original predicate flagging
+      # comment-only diffs as gate failures). The script logs:
+      #
+      #   * ``[OK] coordinator multiagent`` — pins were bumped → require
+      #     a matching active_versions.json diff.
+      #   * ``[SKIP] coordinator multiagent`` — pins already matched
+      #     live → no bump needed → gate passes.
+      #   * (republish not invoked) — no sub-agent updated → no bump
+      #     needed → gate passes.
+      #
+      # The downstream ``verify-multiagent-pin-parity`` step (Plan #44
+      # Task #6) catches the residual "Coordinator pin drifted from
+      # live versions for some other reason" case by querying Anthropic
+      # directly, so this gate intentionally does not duplicate that
+      # check.
+      #
+      # workflow_dispatch runs skip the gate because the operator
+      # already knows what they're doing.
+      - name: Gate on Coordinator multiagent repin
+        if: github.event_name == 'push' && success()
+        run: |
+          set -euo pipefail
+          if [ ! -s /tmp/subagent_tools_output.txt ]; then
+            echo "No update_subagent_tools.py output captured — gate cannot run, skipping."
+            exit 0
+          fi
+          if grep -qE '^\[OK\] coordinator multiagent' /tmp/subagent_tools_output.txt; then
+            echo "update_subagent_tools.py reported [OK] coordinator multiagent — asserting active_versions.json bumped..."
+            versions_diff="$(git diff HEAD -- agents/active_versions.json || true)"
+            if [ -z "${versions_diff}" ]; then
+              echo "::error::PR 3 multiagent repin gate FAILED. update_subagent_tools.py"
+              echo "::error::reported [OK] coordinator multiagent (a real Coordinator"
+              echo "::error::version bump) but active_versions.json is unchanged. The"
+              echo "::error::pin file refresh step in update_subagent_tools.main() did"
+              echo "::error::not run, so the deploy would land with stale Coordinator"
+              echo "::error::multiagent pins — production sessions will dispatch to old"
+              echo "::error::sub-agent versions (the 2026-05-11 \$47 incident mechanic)."
+              echo "::error::"
+              echo "::error::Investigate the update_subagent_tools.py output above for"
+              echo "::error::an exception between the [OK] log and the final write."
+              exit 1
+            fi
+            if ! echo "${versions_diff}" | grep -qE '^\+\s*"coordinator":'; then
+              echo "::error::PR 3 multiagent repin gate FAILED. update_subagent_tools.py"
+              echo "::error::reported [OK] coordinator multiagent but the on-disk"
+              echo "::error::active_versions.json diff has no coordinator entry in the"
+              echo "::error::added lines. The pin refresh wrote partial state — fix the"
+              echo "::error::script and re-run."
+              exit 1
+            fi
+            echo "Coordinator pin bumped in active_versions.json — gate cleared."
+            exit 0
+          fi
+          if grep -qE '^\[SKIP\] coordinator multiagent' /tmp/subagent_tools_output.txt; then
+            echo "update_subagent_tools.py reported [SKIP] coordinator multiagent — pins already matched live, no bump expected. Gate passes."
+            exit 0
+          fi
+          echo "update_subagent_tools.py did not report a Coordinator multiagent action — no sub-agent updated this run. Gate not applicable."
+
+      # Plan #44 Task #6 — verify the Coordinator's multiagent.agents[]
+      # block matches every sub-agent's live ``.version`` after the
+      # tail-call republish in update_prompts.main() and the optional
+      # tools/skills reconcile in update_subagent_tools.main(). If any
+      # entry drifts, the next session against the Coordinator
+      # dispatches to a stale sub-agent — the 2026-05-11 $47 incident
+      # mechanic. Fails loud here so the deploy is red and the operator
+      # knows to re-run rather than ship a silent failure to production.
+      #
+      # Reads the *_AGENT_ID secrets so the script knows which sub-agents
+      # to retrieve. No untrusted github.event input flows into the
+      # heredoc — only ANTHROPIC_API_KEY (from env) is consumed by the
+      # SDK at construction time.
+      - name: verify-multiagent-pin-parity
+        if: success()
+        env:
+          COORDINATOR_ID: ${{ secrets.COORDINATOR_ID }}
+          QUICK_ANSWER_ID: ${{ secrets.QUICK_ANSWER_ID }}
+          DREAM_AGENT_ID: ${{ secrets.DREAM_AGENT_ID }}
+          PIPELINE_MONITOR_ID: ${{ secrets.PIPELINE_MONITOR_ID }}
+          SALES_MONITOR_ID: ${{ secrets.SALES_MONITOR_ID }}
+          POSTSALES_MONITOR_ID: ${{ secrets.POSTSALES_MONITOR_ID }}
+          STATISTICIAN_ID: ${{ secrets.STATISTICIAN_ID }}
+          CHART_DESIGNER_ID: ${{ secrets.CHART_DESIGNER_ID }}
+          ADVERSARIAL_REVIEWER_ID: ${{ secrets.ADVERSARIAL_REVIEWER_ID }}
+          CROSS_DOMAIN_SYNTHESIZER_ID: ${{ secrets.CROSS_DOMAIN_SYNTHESIZER_ID }}
+          WRITING_AGENT_ID: ${{ secrets.WRITING_AGENT_ID }}
+          PROMPT_ENGINEER_ID: ${{ secrets.PROMPT_ENGINEER_ID }}
+          RFP_REVIEWER_ID: ${{ secrets.RFP_REVIEWER_ID }}
+          RFP_RESPONDER_ID: ${{ secrets.RFP_RESPONDER_ID }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, 'agents')
+          import anthropic
+          from update_prompts import AGENTS
+          c = anthropic.Anthropic()
+          coord_id = AGENTS["coordinator"]["id"]
+          coord = c.beta.agents.retrieve(coord_id)
+          print(f"Coordinator ({coord_id}) deployed version: {coord.version}")
+          multiagent = getattr(coord, "multiagent", None)
+          coord_agents = getattr(multiagent, "agents", None) if multiagent else None
+          if not coord_agents:
+              print(
+                  "Coordinator has no multiagent.agents[] block — nothing to "
+                  "verify. If this is a multi-agent build (it should be), "
+                  "run `python agents/update_subagent_tools.py` to re-publish."
+              )
+              sys.exit(0)
+          drift = []
+          for entry in coord_agents:
+              sub_id = getattr(entry, "id", None) or (
+                  entry.get("id") if isinstance(entry, dict) else None
+              )
+              pin_version = getattr(entry, "version", None) or (
+                  entry.get("version") if isinstance(entry, dict) else None
+              )
+              if not sub_id or pin_version is None:
+                  drift.append(f"  entry missing id/version: {entry!r}")
+                  continue
+              try:
+                  sub = c.beta.agents.retrieve(sub_id)
+                  live = int(sub.version)
+              except Exception as exc:
+                  drift.append(f"  sub-agent {sub_id}: retrieve failed: {exc}")
+                  continue
+              if int(pin_version) != live:
+                  drift.append(
+                      f"  sub-agent {sub_id}: coordinator pin v{pin_version}, "
+                      f"live v{live}"
+                  )
+          if drift:
+              print(
+                  "::error::Coordinator multiagent pin parity FAILED. Sub-agent "
+                  "prompt updates landed on Anthropic but the Coordinator is "
+                  "still pinned to old versions — production traffic will "
+                  "dispatch to stale prompts. Re-run this workflow or run "
+                  "`python agents/update_subagent_tools.py` to re-publish.",
+                  file=sys.stderr,
+              )
+              for line in drift:
+                  print(line, file=sys.stderr)
+              sys.exit(1)
+          print(
+              f"All {len(coord_agents)} sub-agent multiagent pin(s) match "
+              f"live versions."
+          )
+          PY
+
+      # Plan #41 — commit the refreshed pin file back to main so CI's
+      # verify-agent-versions job can compare live state to source. The
+      # deploy step writes agents/active_versions.json; this step pushes
+      # the diff. If branch protection blocks the push we fall through
+      # to a follow-up PR via peter-evans/create-pull-request.
+      - name: Commit refreshed active_versions.json
+        id: commit_pins
+        run: |
+          set -euo pipefail
+          # Remove the synthesized .env so we never commit secrets.
+          rm -f .env
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet agents/active_versions.json; then
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            echo "active_versions.json unchanged — no commit needed."
+            exit 0
+          fi
+          echo "no_changes=false" >> "$GITHUB_OUTPUT"
+          git add agents/active_versions.json
+          git commit -m "chore(versions): update active_versions.json after prompt deploy"
+          if git push origin HEAD:main; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "direct push to main blocked — falling back to PR."
+          fi
+
+      - name: Open follow-up PR (only if direct push was blocked)
+        if: steps.commit_pins.outputs.no_changes == 'false' && steps.commit_pins.outputs.pushed == 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/refresh-active-versions
+          title: "chore(versions): refresh active_versions.json after deploy"
+          body: |
+            Auto-generated by `.github/workflows/deploy-prompts.yml` after a
+            successful Managed-Agent prompt deploy. Direct push to `main`
+            was blocked by branch protection, so the pin-file change is
+            being landed via PR instead.
+          commit-message: "chore(versions): refresh active_versions.json after deploy"
+
+      # Plan #41 / PR #98 codex P1 — let new prompt embeddings settle,
+      # then re-run verify_active_versions.py against the freshly-written
+      # pin file. Cheaper than a real session smoke test (which needs an
+      # environment_id + vault setup) and catches the most-likely failure
+      # mode: an update() that ACK'd but didn't actually promote the new
+      # version.
+      #
+      # REQUIRED gate (no continue-on-error). The auto-commit above
+      # pushes agents/active_versions.json back to main using the default
+      # GITHUB_TOKEN, which by design does NOT trigger downstream
+      # workflows (verify-agent-versions.yml will not run on that push).
+      # That means this inline verification is the only thing standing
+      # between a bad deploy and a green check on main. If you would
+      # rather rely on the standalone verify-agent-versions.yml workflow,
+      # swap the push step above to use a PAT or GitHub App token (event
+      # generated by those token types DOES trigger downstream workflows).
+      # Defaulting to inline verification avoids the operator burden of
+      # minting + rotating a separate token.
+      - name: Verify deployed versions match pin file (required gate)
+        if: success()
+        env:
+          # Same defense-in-depth as verify-agent-versions.yml: thread
+          # every *_AGENT_ID secret through so a future env-resolved
+          # agent ID is verified, not silently skipped.
+          COORDINATOR_ID: ${{ secrets.COORDINATOR_ID }}
+          QUICK_ANSWER_ID: ${{ secrets.QUICK_ANSWER_ID }}
+          DREAM_AGENT_ID: ${{ secrets.DREAM_AGENT_ID }}
+          PIPELINE_MONITOR_ID: ${{ secrets.PIPELINE_MONITOR_ID }}
+          SALES_MONITOR_ID: ${{ secrets.SALES_MONITOR_ID }}
+          POSTSALES_MONITOR_ID: ${{ secrets.POSTSALES_MONITOR_ID }}
+          STATISTICIAN_ID: ${{ secrets.STATISTICIAN_ID }}
+          CHART_DESIGNER_ID: ${{ secrets.CHART_DESIGNER_ID }}
+          ADVERSARIAL_REVIEWER_ID: ${{ secrets.ADVERSARIAL_REVIEWER_ID }}
+          CROSS_DOMAIN_SYNTHESIZER_ID: ${{ secrets.CROSS_DOMAIN_SYNTHESIZER_ID }}
+          WRITING_AGENT_ID: ${{ secrets.WRITING_AGENT_ID }}
+          PROMPT_ENGINEER_ID: ${{ secrets.PROMPT_ENGINEER_ID }}
+          RFP_REVIEWER_ID: ${{ secrets.RFP_REVIEWER_ID }}
+          RFP_RESPONDER_ID: ${{ secrets.RFP_RESPONDER_ID }}
+        run: |
+          echo "Sleeping 30s for new-version embedding to settle..."
+          sleep 30
+          # Resynthesize .env (commit step removed it) so the verifier
+          # picks up the API key at import time.
+          echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" > .env
+          python agents/verify_active_versions.py
+          rm -f .env

@@ -1,0 +1,4 @@
+:rotating_light: *[P2]* Partner-channel win rate dropped to 8% (benchmark: 20-30%)
+Current: 8% (n=42) | Prior: 24% (n=58)
+Evidence: 3 new partners onboarded Q1 with no sales training. 12 of 14 partner losses cite champion-left.
+*Recommended:* Pause partner intake until training resumes; brief Sarah at Acme.

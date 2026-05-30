@@ -1,0 +1,368 @@
+version: 1
+description: |
+  Public scrub catalog for the Jared Bot OSS distribution. This file ships
+  in the public repo. It contains ONLY generic shape patterns — regexes that
+  describe the *form* of an identifier (Slack ID, Anthropic vault ID, SF org
+  ID, UUID) without naming any specific portfolio company, vendor, or
+  customer. The literal name lists live in a sibling file:
+
+    bin/scrub-portco-names.yml          (gitignored — the real lists)
+    bin/scrub-portco-names.yml.example  (committed — synthetic placeholders
+                                         for tests and onboarding)
+
+  Both files merge at runtime. The split exists so the public catalog can
+  flip public without re-publishing the very names it is supposed to gate.
+
+  When adding a pattern: pick the right file. Shape regex (any vendor, any
+  portco) goes here. Specific portfolio company or vendor names go in the
+  names file. If unsure, names file is the safer default.
+
+  Severity meaning:
+    HIGH    blocks the public flip (Slack/SF/Anthropic IDs, internal IDs).
+    MEDIUM  review before flip (incident references, tracked binaries).
+    LOW     informational only.
+
+categories:
+  slack_identifiers:
+    severity: HIGH
+    description: |
+      Slack workspace, channel, user, team, DM, and private-channel IDs.
+      Modern Slack IDs no longer always have '0' as the second char (legacy
+      assumption fixed in review). The `(?=[A-Z0-9]*[0-9])` lookahead
+      requires at least one digit in the token, keeping the regex from
+      matching English shouting like TIMESTAMPTZ / COMPRESSED / CONSTRAINT.
+      Private channel + group DM IDs use the `G` prefix and are covered
+      alongside C/D so a leaked private-channel ID is blocked too.
+
+      Boundary semantics: the start uses `(?<![A-Za-z0-9])` and the end
+      uses `(?![A-Z0-9])` instead of `\b`. `\b` does not match between
+      two word chars and `_` is a word char in regex, so common
+      filename/key shapes (e.g. an underscore-flanked Slack ID inside a
+      log filename) were bypassing the gate. Codex round 19 P2.
+    patterns:
+      - name: app_id
+        regex: '(?<![A-Za-z0-9])A(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,}(?![A-Z0-9])'
+      - name: channel_id
+        regex: '(?<![A-Za-z0-9])C(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,}(?![A-Z0-9])'
+      - name: user_id
+        regex: '(?<![A-Za-z0-9])U(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,}(?![A-Z0-9])'
+      - name: team_id
+        regex: '(?<![A-Za-z0-9])T(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,}(?![A-Z0-9])'
+      - name: dm_channel_id
+        regex: '(?<![A-Za-z0-9])D(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,}(?![A-Z0-9])'
+      - name: private_channel_id
+        regex: '(?<![A-Za-z0-9])G(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,}(?![A-Z0-9])'
+
+  anthropic_identifiers:
+    severity: HIGH
+    description: |
+      Anthropic Managed Agent, session, session-thread, vault, environment,
+      message, and memory-store IDs. Session-thread IDs (sthr_*) are emitted
+      whenever a Managed Agents session spawns a sub-thread; they leak
+      through investigation post-mortems and support tickets unless caught
+      here. Memory-store IDs are the same private-resource class as vault
+      IDs and attach to every session (ARCHITECTURE.md/CLAUDE.md).
+      Environment IDs ship with the `env_` prefix per Managed Agents
+      conventions (.env.smoke.example), not `environment_`.
+
+      Boundary semantics: see slack_identifiers description. Codex round
+      19 P2 — `\b` adjacency to `_` misses `sesn_<id>_events.json`.
+    patterns:
+      - name: agent_id
+        regex: '(?<![A-Za-z0-9])agent_[A-Za-z0-9]{20,}(?![A-Za-z0-9])'
+      - name: session_id
+        regex: '(?<![A-Za-z0-9])sesn_[A-Za-z0-9]{20,}(?![A-Za-z0-9])'
+      - name: thread_id
+        regex: '(?<![A-Za-z0-9])sthr_[A-Za-z0-9]{20,}(?![A-Za-z0-9])'
+      - name: vault_id
+        regex: '(?<![A-Za-z0-9])vlt_[A-Za-z0-9]{18,}(?![A-Za-z0-9])'
+      - name: environment_id
+        regex: '(?<![A-Za-z0-9])env_[A-Za-z0-9]{18,}(?![A-Za-z0-9])'
+      - name: msg_id
+        regex: '(?<![A-Za-z0-9])msg_[A-Za-z0-9]{20,}(?![A-Za-z0-9])'
+      - name: memstore_id
+        regex: '(?<![A-Za-z0-9])memstore_[A-Za-z0-9]{18,}(?![A-Za-z0-9])'
+
+  salesforce_identifiers:
+    severity: HIGH
+    description: |
+      SF custom domains and org IDs. Boundary semantics align with
+      slack_identifiers / anthropic_identifiers — codex round 19 P2.
+    patterns:
+      # DNS hostnames are case-insensitive — `[A-Za-z0-9-]` catches a
+      # mixed-case leak (e.g. a capitalized portco prefix copy/pasted
+      # from a doc or env var). The `(?i)` flag on the whole pattern
+      # also case-folds the `.my.salesforce.com` / `.lightning.force.com`
+      # suffix. Codex round 20 P2.
+      - name: my_domain
+        regex: '(?i)(?<![A-Za-z0-9])[A-Za-z0-9-]+\.my\.salesforce\.com(?![A-Za-z0-9])'
+      - name: lightning_domain
+        regex: '(?i)(?<![A-Za-z0-9])[A-Za-z0-9-]+\.lightning\.force\.com(?![A-Za-z0-9])'
+      - name: org_id_15
+        regex: '(?<![A-Za-z0-9])00D[A-Za-z0-9]{12}(?![A-Za-z0-9])'
+      - name: org_id_18
+        regex: '(?<![A-Za-z0-9])00D[A-Za-z0-9]{15}(?![A-Za-z0-9])'
+
+  secrets:
+    severity: HIGH
+    description: |
+      Inline credentials in connection-string URLs — the leak class the
+      hardcoded Railway Postgres URL in smoke_test.py fell into (codex round
+      5). A ``scheme://user:password@host`` string carries a live secret and
+      must never ship; use env vars (DATABASE_URL etc.) instead. Obvious
+      placeholder passwords (password, postgres, user, changeme, example, xxx,
+      replace, your-…) and sub-6-char values are skipped so example configs
+      and docs do not trip the gate.
+    patterns:
+      - name: db_url_with_credentials
+        regex: '(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqps?)://[^:@/\s]+:(?!(?:password|postgres|user|pass|changeme|example|xxx|replace|your[-_a-z]*)@)[^@/\s]{6,}@[^/\s:]+'
+
+  uuids:
+    severity: HIGH
+    description: |
+      Generic UUIDs — usually vault credentials, deployment IDs, or session
+      keys. Case-insensitive on the hex chars because uppercase is a valid
+      UUID representation and a real production UUID could ship that way.
+      Boundary semantics align with slack_identifiers — codex round 19 P2.
+    patterns:
+      - name: uuid_v4
+        regex: '(?<![A-Za-z0-9])[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?![A-Za-z0-9])'
+
+  incident_artifacts:
+    severity: MEDIUM
+    description: |
+      Internal references that point at private incident docs.
+      Boundary semantics align with slack_identifiers — codex round 19 P2.
+    patterns:
+      - name: investigation_id
+        regex: '(?<![A-Za-z0-9])inv \d{2,3}(?![A-Za-z0-9])'
+      - name: pr_reference
+        regex: '(?<![A-Za-z0-9])PR\s*#\d{2,4}(?![A-Za-z0-9])'
+      - name: short_session_id
+        regex: '(?<![A-Za-z0-9])sesn_\d{2}(?![A-Za-z0-9])'
+      - name: plan_id_reference
+        regex: '(?<![A-Za-z0-9])Plan\s*#\d{1,3}(?![A-Za-z0-9])'
+
+  unscanned_binaries:
+    severity: HIGH
+    description: |
+      Tracked binary documents the regex scanner cannot inspect directly.
+      Office artifacts (.docx, .xlsx, .pptx) and PDFs frequently contain
+      the same names + IDs the catalog above blocks; HIGH severity so the
+      gate hard-fails until a human reviews each one and either removes it
+      or adds an explicit allowlist entry with a documented reason.
+      Findings here are emitted by the runner, not matched by a regex.
+    patterns: []
+    extensions:
+      - .docx
+      - .xlsx
+      - .pptx
+      - .pdf
+      - .doc
+      - .xls
+      - .ppt
+      # Data-export artifacts. session_runner produces Salesforce parquet
+      # via dump_sf_query; an accidentally-committed .parquet would carry
+      # raw portco rows. CSV/TSV are common SF/HubSpot exports.
+      - .parquet
+      - .csv
+      - .tsv
+
+  private_catalog_tracked:
+    severity: HIGH
+    description: |
+      Sentinel category fired by the runner when the configured private
+      names catalog (`--names`) is itself tracked by git. The entire
+      point of the names catalog is to be gitignored; a force-add of
+      that file ships every private regex (and therefore every portco /
+      vendor / operator name) publicly. Without this guard the gate
+      can pass clean — the catalog file's contents don't match any
+      public-shape pattern. Codex round 16 P1.
+    patterns: []
+
+exclude_paths:
+  # Repo metadata that shouldn't be scanned
+  - '.git/**'
+  - '.pytest_cache/**'
+  - '.ruff_cache/**'
+  - '*.DS_Store'
+  - '__pycache__/**'
+  - '*__pycache__/**'
+  - '*.pyc'
+  - 'node_modules/**'
+  - '*node_modules/**'
+  - 'venv/**'
+  - '.venv/**'
+  # gstack worktrees are duplicates of the main tree under .claude/
+  - '.claude/worktrees/**'
+  # NOTE: bin/scrub-portco-fixtures/** is NO LONGER excluded — codex round 11
+  # P1 flagged the wholesale exclusion as a back door (a real identifier could
+  # be pasted into a fixture by accident). The allowlist below covers the
+  # intentional fixture hits with text_pattern-bound entries so a real value
+  # in the same file is still caught.
+  # NOTE: docs/plans is scheduled to move to a private side-repo per the
+  # design doc, but until that move completes the scrub gate MUST see those
+  # files so the public-flip green status reflects reality. Do not add
+  # 'docs/plans/**' here.
+  # NOTE: dist/** and build/** are NOT excluded. Codex round 16 P1
+  # flagged this as the same wholesale-exclusion bypass we removed
+  # for bin/scrub-portco-fixtures/**. Tracked artifacts in those
+  # directories ship publicly when the repo flips and must therefore
+  # be scanned. Per-file allowlist entries are the documented escape
+  # hatch when a committed build output is intentionally public.
+
+allowlist:
+  # The committed synthetic template `bin/scrub-portco-names.yml.example`
+  # is the one legitimate file matching the `scrub-portco-names*`
+  # filename shape that the runner otherwise flags as a tracked private
+  # catalog. The runner used to whitelist by basename only; codex round
+  # 18 P1 flagged that as a bypass (a maintainer could overwrite the
+  # template with private content, or save a real catalog under that
+  # basename elsewhere). The exemption is now allowlist-pinned by
+  # content_sha256, so:
+  #   - only the canonical repo path matches the file_glob
+  #   - the file's actual content must hash to the reviewed digest
+  #   - any change to the template requires updating this entry in
+  #     the same commit
+  - file: bin/scrub-portco-names.yml.example
+    pattern: private_catalog_tracked.private_names_catalog
+    content_sha256: '6c74e4195e13eee639f5655f8ed1a9db3c143d8d5c83f36099e07756b20ba44f'
+    reason: committed synthetic template; pinned to reviewed content (round 18 P1)
+
+  # The test file's SYN_* synthetic constants are valid pattern shapes by
+  # design (so each catalog pattern can be exercised in CI), but they are
+  # NOT real production identifiers. Each entry binds a text_pattern that
+  # the matched value must satisfy — so if a future commit pastes a REAL
+  # Slack channel-ID into the test file, the allowlist no longer suppresses
+  # it. (Codex round 8 P2.)
+  # Slack: every SYN_* constant in the test file contains the literal
+  # token "SYN", so a single text_pattern keeps the allowlist concise.
+  # A real production Slack ID would not contain "SYN".
+  - file: bin/scrub_portco_test.py
+    pattern: slack_identifiers.app_id
+    text_pattern: 'SYN'
+    reason: SYN_SLACK_APP synthetic test constant
+  - file: bin/scrub_portco_test.py
+    pattern: slack_identifiers.channel_id
+    text_pattern: 'SYN'
+    reason: SYN_SLACK_CHANNEL + SYN_MODERN_CHANNEL synthetic constants
+  - file: bin/scrub_portco_test.py
+    pattern: slack_identifiers.user_id
+    text_pattern: 'SYN'
+    reason: SYN_SLACK_USER + SYN_MODERN_USER synthetic constants
+  - file: bin/scrub_portco_test.py
+    pattern: slack_identifiers.team_id
+    text_pattern: 'SYN'
+    reason: SYN_SLACK_TEAM synthetic test constant
+  - file: bin/scrub_portco_test.py
+    pattern: slack_identifiers.private_channel_id
+    text_pattern: 'SYN'
+    reason: reserved for future G-channel synthetic samples
+  - file: bin/scrub_portco_test.py
+    pattern: slack_identifiers.dm_channel_id
+    text_pattern: 'SYN'
+    reason: reserved for future D-channel synthetic samples
+  - file: bin/scrub_portco_test.py
+    pattern: anthropic_identifiers.agent_id
+    text_pattern: '^agent_SYN'
+    reason: SYN_AGENT synthetic test constant
+  - file: bin/scrub_portco_test.py
+    pattern: anthropic_identifiers.session_id
+    text_pattern: '^sesn_SYN'
+    reason: SYN_SESSION synthetic test constant
+  - file: bin/scrub_portco_test.py
+    pattern: anthropic_identifiers.thread_id
+    text_pattern: '^sthr_SYN'
+    reason: SYN_THREAD synthetic test constant
+  - file: bin/scrub_portco_test.py
+    pattern: anthropic_identifiers.vault_id
+    text_pattern: '^vlt_SYN'
+    reason: SYN_VAULT synthetic test constant
+  - file: bin/scrub_portco_test.py
+    pattern: anthropic_identifiers.memstore_id
+    text_pattern: '^memstore_SYN'
+    reason: SYN_MEMSTORE synthetic test constant
+  - file: bin/scrub_portco_test.py
+    pattern: salesforce_identifiers.my_domain
+    text_pattern: '^example\.my\.salesforce\.com$'
+    reason: synthetic placeholder SF my-domain in test fixtures
+  - file: bin/scrub_portco_test.py
+    pattern: salesforce_identifiers.lightning_domain
+    text_pattern: '^example\.lightning\.force\.com$'
+    reason: synthetic placeholder SF lightning domain in test fixtures
+  - file: bin/scrub_portco_test.py
+    pattern: salesforce_identifiers.org_id_18
+    text_pattern: '^00DSYNTHETIC'
+    reason: SYN_SF_ORG_18 synthetic test constant
+  - file: bin/scrub_portco_test.py
+    pattern: uuids.uuid_v4
+    text_pattern: '^00112233'
+    reason: SYN_UUID synthetic test constant (matches by prefix to avoid catalog self-match)
+
+  # ---------------------------------------------------------------------------
+  # Forkable-template placeholders (intentional, non-real). Every text_pattern
+  # binds the EXACT placeholder form, so a real identifier pasted anywhere is
+  # still flagged. These cover the example config, .env.example files, the docs,
+  # and the default values in code that a forker replaces with their own.
+  # ---------------------------------------------------------------------------
+  - file: '*'
+    pattern: slack_identifiers.channel_id
+    text_pattern: '^(C0000000000|C0000000001)$'
+    reason: template Slack channel placeholder (replace with your channel ID)
+  - file: '*'
+    pattern: slack_identifiers.user_id
+    text_pattern: '^(U0000000000|U0000000002)$'
+    reason: template Slack user placeholder (replace with your user ID)
+  - file: '*'
+    pattern: salesforce_identifiers.my_domain
+    text_pattern: '^(your-org|acme)\.my\.salesforce\.com$'
+    reason: template Salesforce my-domain placeholder
+  - file: '*'
+    pattern: salesforce_identifiers.lightning_domain
+    text_pattern: '^(your-org|acme)\.lightning\.force\.com$'
+    reason: template Salesforce lightning-domain placeholder
+
+  # Synthetic placeholder/fixture constants used in .env.example, the docs, and
+  # the test suite (example channels, fake SF domains, sample UUIDs). Each
+  # text_pattern binds the exact synthetic value, so a real identifier is still
+  # caught. file:'*' also self-suppresses the copies that appear in this catalog.
+  - file: '*'
+    pattern: slack_identifiers.channel_id
+    text_pattern: '^(C0123456789|C09ABC1234|C0NOTAPORTCO|C0NEWCHAN)$'
+    reason: synthetic Slack channel constants in example env, docs, and tests
+  - file: '*'
+    pattern: slack_identifiers.user_id
+    text_pattern: '^(U0123456789|U9876543210)$'
+    reason: synthetic Slack user constants in example env and docs
+  # C12345678 + abcwidgets are scrub_portco_test.py's OWN fixtures. The gate
+  # must suppress them where they sit in source (test file + this catalog),
+  # but the patterns must still FIRE when the same strings are written into a
+  # tmp_path subprocess scan — that is exactly what the scrub self-tests
+  # assert. Scoping to 'bin/scrub*' covers the test source + this catalog
+  # without matching the subprocess's relative paths (e.g. tmp_path/junk.py),
+  # so detection still works there. A blanket file:'*' would wrongly silence
+  # the self-tests. (Forkable-template hardening, 2026-05.)
+  - file: 'bin/scrub*'
+    pattern: slack_identifiers.channel_id
+    text_pattern: '^C12345678$'
+    reason: C12345678 fixture in scrub_portco_test.py + this catalog
+  - file: 'scripts/upsert_slack_channel_canvas.py'
+    pattern: slack_identifiers.channel_id
+    text_pattern: '^C12345678$'
+    reason: C12345678 docstring example in upsert_slack_channel_canvas
+  - file: 'bin/scrub*'
+    pattern: salesforce_identifiers.my_domain
+    text_pattern: '(?i)^abcwidgets\.my\.salesforce\.com$'
+    reason: ABCWidgets synthetic SF my-domain in scrub test fixtures + catalog
+  - file: 'bin/scrub*'
+    pattern: salesforce_identifiers.lightning_domain
+    text_pattern: '(?i)^abcwidgets\.lightning\.force\.com$'
+    reason: ABCWidgets synthetic SF lightning domain in scrub test fixtures + catalog
+  - file: '*'
+    pattern: salesforce_identifiers.org_id_18
+    text_pattern: '^00D000000000000AAA$'
+    reason: template Salesforce org-id placeholder
+  - file: '*'
+    pattern: uuids.uuid_v4
+    text_pattern: '^(019e6a5b-831e-7fe0-abb0-91ee7a97cfaa|aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)$'
+    reason: synthetic correlation-id UUIDs in tests

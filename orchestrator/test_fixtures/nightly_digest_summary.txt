@@ -1,0 +1,6 @@
+*Overnight: 2 portcos need attention*
+Action needed: Acme, Acme
+:eyes: *[P2]* *GRR dropped 1.2pp at Acme* — 84.3% (was 85.5%) `[HIGH]`
+_Full report: https://outputs.example/report-2026-05-11_
+
+_Reply `expand:` in this thread for the full analysis._

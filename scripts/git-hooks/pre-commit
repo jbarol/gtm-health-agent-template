@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Block direct commits on the default branch.
+# All work must land via feature branch → PR → review → auto-merge.
+# Override (for emergencies): git commit --no-verify
+#
+# Installed manually; not tracked in git. To reinstall in a fresh clone:
+#   cp scripts/git-hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -euo pipefail
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+PROTECTED_BRANCHES=("main" "master")
+
+for protected in "${PROTECTED_BRANCHES[@]}"; do
+  if [ "$BRANCH" = "$protected" ]; then
+    echo ""
+    echo "❌  Refusing commit on protected branch '$BRANCH'."
+    echo ""
+    echo "Workflow: feature branch → PR → code review → auto-merge."
+    echo ""
+    echo "To proceed:"
+    echo "  git checkout -b <feature-branch-name>"
+    echo "  git commit ..."
+    echo "  git push -u origin <feature-branch-name>"
+    echo "  gh pr create"
+    echo "  gh pr merge --auto --squash"
+    echo ""
+    echo "Emergency override: git commit --no-verify (avoid)"
+    echo ""
+    exit 1
+  fi
+done
+
+exit 0
