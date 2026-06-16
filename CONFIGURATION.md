@@ -88,6 +88,14 @@ here blocks startup.
 | `SLACK_ADMIN_USER_IDS` | Comma-separated Slack user IDs treated as admins: they gate privileged slash commands and receive admin-only DMs (catastrophic-failure notices, cost digests, drift watch lines). Leave empty to disable admin DMs. |
 | `ANTHROPIC_WEBHOOK_SIGNING_KEY` | HMAC signing key for the `/webhooks/anthropic` handler. When unset, the handler rejects every request with 400. |
 | `ANTHROPIC_WEBHOOK_URL` | Public URL the Anthropic webhook subscription points at (your Railway URL plus `/webhooks/anthropic`). |
+| `RAW_HOT_WINDOW_DAYS` | Days the bulky raw child rows of a snapshot stay hot in Postgres before the archive-gated purge (Tier 3) drops them. Default `60`. The `snapshots` metadata row and `daily_metrics` are kept forever regardless. |
+| `ARCHIVE_BUCKET_ENABLED` | Master switch for the Parquet cold archive (snapshot retention Tier 2). Default `false`. When off (or any `ARCHIVE_S3_*` below is unset), archiving is a no-op and the purge falls back to a rollup-only guarantee. |
+| `ARCHIVE_S3_ENDPOINT` | S3-compatible endpoint URL for the archive bucket (e.g. a Railway object-storage bucket). Required when `ARCHIVE_BUCKET_ENABLED=true`. |
+| `ARCHIVE_S3_BUCKET` | Bucket name the dated Parquet files are uploaded to. |
+| `ARCHIVE_S3_ACCESS_KEY_ID` | Access key ID for the archive bucket. Set as a Railway service variable in production, not local `.env`. |
+| `ARCHIVE_S3_SECRET_ACCESS_KEY` | Secret access key for the archive bucket. Set as a Railway service variable in production, not local `.env`. |
+| `ARCHIVE_S3_REGION` | Region for the archive bucket. Default `auto`. |
+| `ARCHIVE_S3_PREFIX` | Key prefix under which archives are written (`{prefix}/{portco}/{date}/{table}.parquet`). Default `gtm-archive`. |
 
 ### Portco-specific
 
