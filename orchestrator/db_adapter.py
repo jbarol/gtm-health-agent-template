@@ -1562,6 +1562,325 @@ def purge_session_thread_events_older_than(
         return 0
 
 
+# Heavy snapshot child tables — full SF row copies written each night. These
+# are the only things the hot-window purge touches; the snapshots metadata
+# row and daily_metrics rollup are kept forever (incident 2026-06-16).
+_SNAPSHOT_CHILD_TABLES = ("opportunities", "leads", "contacts", "accounts")
+
+# Days of raw child rows kept hot in Postgres. Older rows are dropped only
+# AFTER the day's rollup + (if enabled) Parquet archive are confirmed, so
+# nothing the snapshots exist for is lost — only the bulky hot copy ages out.
+RAW_HOT_WINDOW_DAYS = int(os.environ.get("RAW_HOT_WINDOW_DAYS", "60"))
+
+
+def get_snapshot_date(snapshot_id: int):
+    """Return the ``snapshot_date`` (datetime.date) for a snapshot, or None."""
+    if not DATABASE_URL:
+        return None
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT snapshot_date FROM snapshots WHERE id = %s", (snapshot_id,)
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception:
+        log.exception(f"get_snapshot_date failed for snapshot {snapshot_id}")
+        return None
+
+
+def compute_and_store_daily_metrics(snapshot_id: int, portco_key: str) -> bool:
+    """Tier 1: roll a completed snapshot up into the forever ``daily_metrics`` row.
+
+    Runs a handful of aggregate queries scoped to ``snapshot_id`` and upserts
+    one compact JSONB row keyed by (portco_key, snapshot_date). This is the
+    "what was pipeline on date X / what changed" layer the snapshots exist
+    for — kept forever at a few KB/day while the bulky raw rows age out of
+    Postgres (see :func:`purge_raw_rows_older_than`).
+
+    Idempotent: re-running for the same day overwrites the row and re-stamps
+    ``snapshots.metrics_rolled_up_at``. Day-over-day "what changed" is derived
+    at query time by diffing consecutive daily_metrics rows, so no deltas are
+    stored here. Returns True on success, False if the DB is unavailable or
+    the snapshot has no date.
+    """
+    if not DATABASE_URL:
+        return False
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT snapshot_date FROM snapshots WHERE id = %s", (snapshot_id,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+                snap_date = row[0]
+                metrics = _aggregate_snapshot_metrics(cur, snapshot_id, snap_date)
+                cur.execute(
+                    "INSERT INTO daily_metrics "
+                    "  (portco_key, snapshot_id, snapshot_date, metrics, computed_at) "
+                    "VALUES (%s, %s, %s, %s, NOW()) "
+                    "ON CONFLICT (portco_key, snapshot_date) DO UPDATE SET "
+                    "  snapshot_id = EXCLUDED.snapshot_id, "
+                    "  metrics = EXCLUDED.metrics, "
+                    "  computed_at = NOW()",
+                    (portco_key, snapshot_id, snap_date, json.dumps(metrics)),
+                )
+                cur.execute(
+                    "UPDATE snapshots SET metrics_rolled_up_at = NOW() WHERE id = %s",
+                    (snapshot_id,),
+                )
+                conn.commit()
+                log.info(
+                    f"daily_metrics rolled up for {portco_key} {snap_date} "
+                    f"(snapshot {snapshot_id})"
+                )
+                return True
+        finally:
+            conn.close()
+    except Exception:
+        log.exception(
+            f"compute_and_store_daily_metrics failed for snapshot {snapshot_id}"
+        )
+        return False
+
+
+def _aggregate_snapshot_metrics(cur, snapshot_id: int, snap_date) -> dict:
+    """Run the rollup aggregate queries for one snapshot; return a JSON-able dict.
+
+    Split out from :func:`compute_and_store_daily_metrics` so it is unit-test
+    friendly (a fake cursor can feed canned rows). All money/count math is
+    plain Postgres aggregation scoped by ``snapshot_id``.
+    """
+
+    def _f(v):  # Decimal/None -> float for JSON
+        return float(v) if v is not None else 0.0
+
+    # Opportunities — pipeline + movement.
+    cur.execute(
+        "SELECT "
+        "  COUNT(*) FILTER (WHERE is_closed = false), "
+        "  COALESCE(SUM(amount) FILTER (WHERE is_closed = false), 0), "
+        "  COALESCE(AVG(amount) FILTER (WHERE is_closed = false), 0), "
+        "  COALESCE(SUM(amount * COALESCE(probability, 0) / 100.0) "
+        "           FILTER (WHERE is_closed = false), 0), "
+        "  COUNT(*), "
+        "  COUNT(*) FILTER (WHERE created_date::date = %s), "
+        "  COUNT(*) FILTER (WHERE is_won = true AND close_date = %s), "
+        "  COALESCE(SUM(amount) FILTER (WHERE is_won = true AND close_date = %s), 0), "
+        "  COUNT(*) FILTER (WHERE is_closed = true AND is_won = false "
+        "                   AND close_date = %s), "
+        "  COUNT(*) FILTER (WHERE is_won = true), "
+        "  COUNT(*) FILTER (WHERE is_closed = true) "
+        "FROM opportunities WHERE snapshot_id = %s",
+        (snap_date, snap_date, snap_date, snap_date, snapshot_id),
+    )
+    o = cur.fetchone()
+    won_all, closed_all = int(o[9]), int(o[10])
+    pipeline = {
+        "open_opp_count": int(o[0]),
+        "open_pipeline_amount": _f(o[1]),
+        "avg_open_deal_size": _f(o[2]),
+        "weighted_open_pipeline": _f(o[3]),
+        "total_opp_count": int(o[4]),
+        "new_opps_today": int(o[5]),
+        "won_today_count": int(o[6]),
+        "won_today_amount": _f(o[7]),
+        "lost_today_count": int(o[8]),
+        "lifetime_won_count": won_all,
+        "lifetime_closed_count": closed_all,
+        "lifetime_win_rate_pct": round(100.0 * won_all / closed_all, 2)
+        if closed_all
+        else 0.0,
+    }
+
+    # Open pipeline by stage.
+    cur.execute(
+        "SELECT COALESCE(stage_name, '(none)'), COUNT(*), COALESCE(SUM(amount), 0) "
+        "FROM opportunities WHERE snapshot_id = %s AND is_closed = false "
+        "GROUP BY stage_name",
+        (snapshot_id,),
+    )
+    pipeline["by_stage"] = {
+        r[0]: {"count": int(r[1]), "amount": _f(r[2])} for r in cur.fetchall()
+    }
+
+    # Leads — funnel.
+    cur.execute(
+        "SELECT "
+        "  COUNT(*), "
+        "  COUNT(*) FILTER (WHERE created_date::date = %s), "
+        "  COUNT(*) FILTER (WHERE is_converted = true), "
+        "  COUNT(*) FILTER (WHERE mql_date IS NOT NULL), "
+        "  COUNT(*) FILTER (WHERE sql_date IS NOT NULL), "
+        "  COUNT(*) FILTER (WHERE discovery_call_booked IS NOT NULL) "
+        "FROM leads WHERE snapshot_id = %s",
+        (snap_date, snapshot_id),
+    )
+    le = cur.fetchone()
+    total_leads, converted = int(le[0]), int(le[2])
+    leads = {
+        "total_leads": total_leads,
+        "new_leads_today": int(le[1]),
+        "converted_count": converted,
+        "mql_count": int(le[3]),
+        "sql_count": int(le[4]),
+        "discovery_booked_count": int(le[5]),
+        "lead_conversion_rate_pct": round(100.0 * converted / total_leads, 2)
+        if total_leads
+        else 0.0,
+    }
+    cur.execute(
+        "SELECT COALESCE(funnel_stage, '(none)'), COUNT(*) "
+        "FROM leads WHERE snapshot_id = %s GROUP BY funnel_stage",
+        (snapshot_id,),
+    )
+    leads["by_funnel_stage"] = {r[0]: int(r[1]) for r in cur.fetchall()}
+
+    # Accounts / contacts — counts + ARR.
+    cur.execute(
+        "SELECT COUNT(*), COALESCE(SUM(arr), 0) FROM accounts WHERE snapshot_id = %s",
+        (snapshot_id,),
+    )
+    a = cur.fetchone()
+    cur.execute(
+        "SELECT COUNT(*) FROM contacts WHERE snapshot_id = %s", (snapshot_id,)
+    )
+    c = cur.fetchone()
+
+    return {
+        "pipeline": pipeline,
+        "leads": leads,
+        "accounts": {"account_count": int(a[0]), "total_arr": _f(a[1])},
+        "contacts": {"contact_count": int(c[0])},
+    }
+
+
+def mark_snapshot_archived(snapshot_id: int, archive_uri: str) -> bool:
+    """Tier 2 bookkeeping: record that a snapshot's raw rows are in cold storage.
+
+    Called by the archiver after a successful Parquet upload. The purge
+    (Tier 3) requires ``archived_at`` to be set before dropping the hot
+    child rows whenever archiving is enabled.
+    """
+    if not DATABASE_URL:
+        return False
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE snapshots SET archived_at = NOW(), archive_uri = %s "
+                    "WHERE id = %s",
+                    (archive_uri, snapshot_id),
+                )
+                conn.commit()
+                return True
+        finally:
+            conn.close()
+    except Exception:
+        log.exception(f"mark_snapshot_archived failed for snapshot {snapshot_id}")
+        return False
+
+
+def fetch_snapshot_rows(snapshot_id: int, table: str) -> list[dict]:
+    """Return all rows of one snapshot child table as dicts (for archival).
+
+    ``table`` must be one of the whitelisted snapshot child tables. Used by
+    the Parquet archiver to stream a snapshot to cold storage before the
+    hot rows are purged.
+    """
+    if not DATABASE_URL or table not in _SNAPSHOT_CHILD_TABLES:
+        return []
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT * FROM {table} WHERE snapshot_id = %s",  # noqa: S608 — whitelist
+                    (snapshot_id,),
+                )
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception:
+        log.exception(f"fetch_snapshot_rows failed ({table}, snapshot {snapshot_id})")
+        return []
+
+
+def purge_raw_rows_older_than(
+    days: int = RAW_HOT_WINDOW_DAYS,
+    archive_required: bool = True,
+    max_snapshots_per_call: int = 10,
+) -> int:
+    """Tier 3: drop the bulky child rows of snapshots older than ``days``.
+
+    This is the bounded hot-window sweep that keeps Postgres from refilling
+    after incident 2026-06-16. It deletes ONLY the heavy child rows
+    (opportunities/leads/contacts/accounts); the ``snapshots`` metadata row
+    and the forever ``daily_metrics`` rollup are never touched, so "pipeline
+    on date X" still answers for every historical day.
+
+    A snapshot's raw rows are eligible only when:
+      * it is older than ``days`` (by snapshot_date), AND
+      * ``metrics_rolled_up_at`` is set (Tier 1 captured the day), AND
+      * if ``archive_required``, ``archived_at`` is set (Tier 2 put the raw
+        rows in cold storage).
+
+    So nothing is deleted until it is preserved in at least the rollup (and,
+    when archiving is on, the Parquet archive too). ``max_snapshots_per_call``
+    caps the lock window so the first post-incident drain of the backlog
+    spreads across daily ticks. Returns the number of snapshots whose rows
+    were purged; 0 means nothing eligible or the DB is unavailable.
+    """
+    if not DATABASE_URL or days <= 0:
+        return 0
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM snapshots "
+                    "WHERE snapshot_date < CURRENT_DATE - (%s || ' days')::interval "
+                    "  AND metrics_rolled_up_at IS NOT NULL "
+                    "  AND raw_purged_at IS NULL "
+                    "  AND (%s = false OR archived_at IS NOT NULL) "
+                    "ORDER BY snapshot_date ASC LIMIT %s",
+                    (str(int(days)), archive_required, int(max_snapshots_per_call)),
+                )
+                old_ids = [r[0] for r in cur.fetchall()]
+                if not old_ids:
+                    return 0
+                for child in _SNAPSHOT_CHILD_TABLES:
+                    cur.execute(
+                        f"DELETE FROM {child} WHERE snapshot_id = ANY(%s)",  # noqa: S608 — whitelist
+                        (old_ids,),
+                    )
+                cur.execute(
+                    "UPDATE snapshots SET raw_purged_at = NOW() WHERE id = ANY(%s)",
+                    (old_ids,),
+                )
+                conn.commit()
+                log.info(
+                    f"purge_raw_rows_older_than: purged raw rows for "
+                    f"{len(old_ids)} snapshot(s) older than {days}d "
+                    f"(archive_required={archive_required})"
+                )
+                return len(old_ids)
+        finally:
+            conn.close()
+    except Exception:
+        log.exception("purge_raw_rows_older_than failed")
+        return 0
+
+
 def create_investigation(
     question: str,
     thread_ts: str = None,

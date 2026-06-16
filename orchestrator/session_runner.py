@@ -5601,6 +5601,24 @@ def run_sync_session(portco_key: str):
     db_adapter.complete_snapshot(snapshot_id, record_counts)
     log.info(f"Sync complete for {portco_key}: {record_counts}")
 
+    # Post-sync retention pipeline (incident 2026-06-16). The snapshot is now
+    # known-good, so (1) roll it up into the forever daily_metrics row and
+    # (2) archive the full raw rows to Parquet cold storage. Both are
+    # best-effort and must never break the sync: a rollup/archive failure
+    # just leaves the snapshot un-stamped, which holds its hot rows in
+    # Postgres (the purge is gated on both) until the next run succeeds.
+    try:
+        db_adapter.compute_and_store_daily_metrics(snapshot_id, portco_key)
+    except Exception:
+        log.exception(f"daily_metrics rollup failed for {portco_key} (non-fatal)")
+    try:
+        import snapshot_archive
+
+        snap_date = db_adapter.get_snapshot_date(snapshot_id)
+        snapshot_archive.archive_snapshot(snapshot_id, portco_key, snap_date)
+    except Exception:
+        log.exception(f"snapshot archive failed for {portco_key} (non-fatal)")
+
     failed_objects = [k for k, v in record_counts.items() if v == 0]
     if failed_objects:
         send_notification(
