@@ -1111,6 +1111,47 @@ def scheduled_purge_session_thread_events():
         )
 
 
+def scheduled_purge_old_snapshots():
+    """Tier 3: drop the bulky raw child rows of snapshots past the hot window.
+
+    Each nightly DB sync appends a full copy of every SF object under a new
+    snapshot_id; nothing removed them, so the Postgres volume filled and
+    wedged the database in an end-of-recovery checkpoint crash loop
+    (incident 2026-06-16, "No space left on device").
+
+    This sweep deletes ONLY the heavy child rows (opportunities/leads/
+    contacts/accounts) for snapshots older than RAW_HOT_WINDOW_DAYS, and only
+    once that day is preserved elsewhere: its daily_metrics rollup is computed
+    AND — when archiving is enabled — its Parquet archive is confirmed. The
+    snapshots metadata row and the forever daily_metrics rollup are never
+    touched, so "pipeline on date X" still answers for every historical day.
+
+    ``archive_required`` follows ``snapshot_archive.archive_enabled()``: if
+    the bucket is configured we wait for the cold archive before dropping hot
+    rows; if not, we fall back to a rollup-only guarantee (metrics kept
+    forever, raw drill-down bounded to the hot window).
+
+    Idempotent and capped per call, so the first drain of the post-incident
+    backlog spreads over several ticks. Never crashes the scheduler thread.
+    """
+    log.info("Starting hot-window raw-row purge")
+    try:
+        import snapshot_archive
+        from db_adapter import purge_raw_rows_older_than
+
+        purged = purge_raw_rows_older_than(
+            archive_required=snapshot_archive.archive_enabled()
+        )
+        log.info(f"hot-window raw-row purge completed: {purged} snapshot(s) purged")
+    except Exception:
+        log.exception("hot-window raw-row purge failed")
+        send_notification(
+            "watch",
+            "hot-window raw-row purge failed — Postgres volume growth is "
+            "unbounded until the next run succeeds (incident 2026-06-16)",
+        )
+
+
 def scheduled_sweep_orphan_thread_placeholders():
     """15-min sweep of orphan ``nightly_run_threads`` placeholder rows.
 
@@ -2026,6 +2067,24 @@ def main():
     )
     log.info(
         f"Registered session_thread_events 30-day TTL purge at 06:00 {config.TIMEZONE}"
+    )
+
+    # Incident 2026-06-16 — Tier 3 hot-window raw-row purge. The nightly 1am
+    # sync appends a full copy of every SF object under a new snapshot_id and
+    # nothing removed the old ones, so the Postgres volume filled and wedged
+    # the DB in an end-of-recovery checkpoint crash loop. This drops only the
+    # bulky child rows of snapshots past RAW_HOT_WINDOW_DAYS, gated on rollup
+    # + archive so nothing the snapshots exist for is lost. Runs at 06:15 PT —
+    # after the events purge, well clear of the 1am sync. DATABASE_URL-gated
+    # inside the purge so dev / degraded prod no-op safely.
+    scheduler.add_job(
+        scheduled_purge_old_snapshots,
+        CronTrigger.from_crontab("15 6 * * *", timezone=config.TIMEZONE),
+        id="hot-window-raw-purge",
+        name="Hot-Window Raw-Row Purge",
+    )
+    log.info(
+        f"Registered hot-window raw-row purge at 06:15 {config.TIMEZONE}"
     )
 
     # Task #22 — Orphan placeholder sweep for nightly_run_threads. The

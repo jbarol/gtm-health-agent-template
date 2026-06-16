@@ -182,6 +182,7 @@ APScheduler cron (Pacific). All user-facing daily Slack-posting crons were retir
 - 4am — compresr cache expiry (7-day TTL sweep)
 - 6am — Anthropic Admin API daily cost pull (when `ANTHROPIC_ADMIN_KEY` set)
 - 6am — `session_thread_events` 30-day TTL purge
+- 6:15am — hot-window raw-row purge (snapshot retention Tier 3, gated on rollup + archive)
 - 8am — surface refresh (Canvas push per active portco)
 - every 15min — batch poll (when `BATCH_PROCESSING_ENABLED`)
 - every 30s — session-size canary (log-only)
