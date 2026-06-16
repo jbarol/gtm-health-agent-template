@@ -1,6 +1,21 @@
 {
   "global": {
-    "last_full_scan_iso": "2026-06-16T12:20:35Z"
+    "last_full_scan_iso": "2026-06-16T17:26:04Z"
   },
-  "pr_state": {}
+  "pr_state": {
+    "1": {
+      "first_seen_iso": "2026-06-16T17:26:02Z",
+      "fixes_today": 0,
+      "fixes_today_date": "2026-06-16",
+      "last_seen_comment_ids": [
+        3422693865,
+        3422693873,
+        3422693877,
+        4721383577
+      ],
+      "last_updated_iso": "2026-06-16T17:26:04Z",
+      "quiet_loops": 0,
+      "watcher_touched": false
+    }
+  }
 }
