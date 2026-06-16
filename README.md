@@ -69,6 +69,8 @@ You provision five required services and, optionally, up to five more. Everythin
 
 **Salesforce custom fields.** For the nightly sync to write complete rows, the `Lead` object needs four custom fields: `Discovery_Call_Booked__c`, `Funnel_Stage__c`, `MQL_SDR_Accepted_Date_Time__c`, and `SDR_Qualified_Date_Time__c`. An optional `Product_Line__c` on `Opportunity` enables cross-cuts like Industry × Product Line from Postgres. Missing fields are written as `NULL` rather than crashing the sync. See [CONFIGURATION.md](CONFIGURATION.md) for the field-by-field detail and backfill scripts.
 
+**Snapshot retention.** The nightly sync appends a full copy of every object under a new snapshot, so Postgres would grow unboundedly without retention. A three-tier model bounds it: a compact per-portco-per-day `daily_metrics` rollup kept forever (the "pipeline on date X" layer), an optional Parquet cold archive of the full raw rows to an S3-compatible bucket kept forever off-volume, and a hot-window purge that drops only the bulky raw rows older than `RAW_HOT_WINDOW_DAYS` (default 60) once the rollup — and, when enabled, the archive — is confirmed. The archive is off by default; turn it on with `ARCHIVE_BUCKET_ENABLED=true` and the `ARCHIVE_S3_*` credentials (an S3-compatible bucket such as a Railway object-storage bucket). It adds one dependency, `boto3`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the tier model and [CONFIGURATION.md](CONFIGURATION.md) for every env var.
+
 ## Quickstart
 
 Run a local instance against your own Slack workspace, CRM, and Anthropic org.

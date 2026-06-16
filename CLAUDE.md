@@ -259,6 +259,40 @@ Z2 deploy verification (Track Z of the misty-squishing-badger plan) curls `/heal
 
 Verified on 2026-05-14: `/health` `build_commit` plumbing works end-to-end on prod (`https://your-app.up.railway.app/health` returned a real SHA — `8ddb97b...` — not `unknown`). On that day the SHA also lagged `origin/main` because auto-deploy is OFF per `railway.toml` D3 — the deploy workflow had not yet shipped the most recent merge. This does NOT mean future mismatches are safe to dismiss: Z2 verification compares against the SHA the deploy step just shipped (`gh run view` of the deploy workflow), not raw `origin/main`. A `build_commit` that disagrees with the just-shipped SHA — or is `unknown` — is still a hard fail and must block green status.
 
+## Snapshot retention
+
+The nightly SF→Postgres sync appends a FULL copy of every object
+(opportunities/leads/contacts/accounts) under a new `snapshot_id`. With no
+retention this fills the Postgres volume (~125 MB/snapshot ≈ 45 GB/year on a 5 GB
+volume — the failure mode behind incident 2026-06-16). A three-tier model keeps
+the history the snapshots exist for while bounding the hot DB. Migration:
+`orchestrator/migrations/00AU_daily_metrics_and_archive.sql`.
+
+- **Tier 1 — `daily_metrics` (kept FOREVER).** Compact per-portco-per-day JSONB
+  rollup computed after each sync by `db_adapter.compute_and_store_daily_metrics`:
+  open pipeline $, stage mix, daily movement, lead funnel (MQL/SQL/discovery),
+  conversion, ARR + counts. This is the "what was pipeline on date X / what
+  changed" layer — a few KB/day. JSONB so the rollup set can grow without a
+  migration. `snapshots.metrics_rolled_up_at` records that the day was captured.
+- **Tier 2 — Parquet cold archive (kept FOREVER, off-volume).**
+  `orchestrator/snapshot_archive.py:archive_snapshot` writes the day's full raw
+  rows to dated Parquet and uploads them to an S3-compatible bucket (~50x cheaper
+  per GB than the DB volume; layout `{prefix}/{portco}/{date}/{table}.parquet`).
+  Uses boto3 (lazy import). OPTIONAL — gated by `ARCHIVE_BUCKET_ENABLED` plus the
+  `ARCHIVE_S3_*` creds; a logged no-op when unset. `snapshots.archived_at` /
+  `archive_uri` track it.
+- **Tier 3 — hot-window purge.** `db_adapter.purge_raw_rows_older_than`, run by the
+  06:15 PT "Hot-Window Raw-Row Purge" cron. Drops only the bulky child rows of
+  snapshots older than `RAW_HOT_WINDOW_DAYS` (default 60), and only after the day's
+  rollup is computed AND — when archiving is on — the archive is confirmed. The
+  `snapshots` metadata row and `daily_metrics` are NEVER deleted; a purged snapshot
+  becomes "rollup-only" (`raw_purged_at` set), keeping the forever index intact.
+
+**Env vars** (all in `.env.example`; see CONFIGURATION.md for the table):
+`ARCHIVE_BUCKET_ENABLED`, `ARCHIVE_S3_ENDPOINT`, `ARCHIVE_S3_BUCKET`,
+`ARCHIVE_S3_ACCESS_KEY_ID`, `ARCHIVE_S3_SECRET_ACCESS_KEY`, `ARCHIVE_S3_REGION`,
+`ARCHIVE_S3_PREFIX`, `RAW_HOT_WINDOW_DAYS`. New dependency: `boto3>=1.34.0`.
+
 ## Multi-Portco
 
 `portco_config.json` maps each company to data sources, Slack channel, and metadata. Currently only Acme is active. Portco isolation: each company gets its own Slack channel and memory store subdirectory. Channel-to-portco lookup in `portco_registry.py`. Platform priority ranking governs cross-source precedence (Salesforce 100, Zoho 90, HubSpot 80, etc.).

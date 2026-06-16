@@ -170,6 +170,33 @@ call with extended thinking, leading with the most critical finding, comparing t
 benchmarks, and recommending actions. Output is formatted for Slack mrkdwn and split
 to respect the 3000-character block limit.
 
+## Snapshot retention
+
+The nightly mirror appends a full copy of every object under a new `snapshot_id`
+and never overwrites prior snapshots, so without bounds the Postgres volume grows
+unboundedly (~125 MB/snapshot). A three-tier retention model (migration
+`orchestrator/migrations/00AU_daily_metrics_and_archive.sql`) keeps the long-term
+history the snapshots exist for while capping what stays hot in the database:
+
+- **Tier 1 — `daily_metrics` (forever).** After each sync,
+  `db_adapter.compute_and_store_daily_metrics` writes a compact per-portco-per-day
+  JSONB rollup (open pipeline, stage mix, daily movement, lead funnel, conversion,
+  ARR, counts) — a few KB/day. This is the "pipeline on date X / what changed"
+  layer and is never deleted. `snapshots.metrics_rolled_up_at` flags the day as
+  captured.
+- **Tier 2 — Parquet cold archive (forever, off-volume).**
+  `orchestrator/snapshot_archive.py:archive_snapshot` writes the day's full raw
+  rows to dated Parquet and uploads them to an S3-compatible bucket (~50x cheaper
+  per GB than the DB volume), so the complete row-level history is retained off the
+  hot volume. Optional, gated by `ARCHIVE_BUCKET_ENABLED` plus `ARCHIVE_S3_*`
+  credentials; a no-op when unset. `snapshots.archived_at` / `archive_uri` track it.
+- **Tier 3 — hot-window purge.** A 06:15 PT cron calls
+  `db_adapter.purge_raw_rows_older_than`, dropping only the bulky child rows of
+  snapshots older than `RAW_HOT_WINDOW_DAYS` (default 60) — and only after the
+  day's rollup is computed and (when archiving is on) the archive confirmed. The
+  `snapshots` metadata row and `daily_metrics` survive, leaving a "rollup-only"
+  snapshot (`raw_purged_at` set).
+
 ## Memory
 
 Two Anthropic memory stores attach to every session:
