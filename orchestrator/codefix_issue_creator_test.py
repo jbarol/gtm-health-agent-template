@@ -24,6 +24,14 @@ import pytest
 import codefix_issue_creator as cic
 
 
+@pytest.fixture(autouse=True)
+def _no_open_github_issues(monkeypatch):
+    """Default the open-issue dedup lookup to empty so tests never shell out to
+    the real ``gh`` CLI / live GitHub. Tests that exercise the open-issue dedup
+    override this explicitly."""
+    monkeypatch.setattr(cic, "list_open_issues_with_label", lambda label: [])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures — fake memory store + fake Anthropic client
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,7 +67,7 @@ _SOURCE_THREE_BLOCKS = """# Session Learnings — sesn_EXAMPLE (2026-05-10)
 _EMPTY_LEDGER = ""
 
 # Ledger with a prior fingerprint already created (for the dedup-across-runs test).
-# Fingerprint must match what _fingerprint("soql case rejected", "orchestrator/session_runner.py", "add runtime soql validator") produces.
+# Fingerprint must match what _fingerprint("soql case rejected", "orchestrator/session_runner.py") produces.
 
 
 @pytest.fixture
@@ -361,7 +369,6 @@ def test_dedup_across_runs(monkeypatch):
     fp = cic._fingerprint(
         "soql case rejected",
         "orchestrator/session_runner.py",
-        "add runtime soql validator",
     )
     # Pre-seed the applied ledger with that row.
     prior_ledger = (
@@ -438,19 +445,16 @@ def test_fingerprint_normalization_collapses_whitespace_and_session_ids():
     a = cic._fingerprint(
         "SOQL CASE Rejected",
         "orchestrator/session_runner.py",
-        "Add runtime SOQL validator",
     )
     b = cic._fingerprint(
         "soql   case  rejected\n",
         "orchestrator/session_runner.py",
-        "  add runtime soql validator  ",
     )
     assert a == b
     # Session-id and date should not affect the fingerprint.
     c = cic._fingerprint(
         "soql case rejected sesn_EXAMPLE 2026-05-10",
         "orchestrator/session_runner.py",
-        "add runtime soql validator",
     )
     assert a == c
 
@@ -462,3 +466,54 @@ def test_split_blocks_disambiguates_repeat_headings():
     assert ids[0] == "SOQL CASE rejected by Salesforce"
     assert ids[1] == "SOQL CASE rejected by Salesforce #2"
     assert ids[2] == "Coordinator skipped write_prose"
+
+
+def test_fingerprint_ignores_proposed_action_drift():
+    """Regression for #303/#305: same (error, file) → same fingerprint
+    regardless of how the proposed-action phrasing drifts (it's no longer
+    part of the key)."""
+    a = cic._fingerprint(
+        "ordereddict serialized as str", "orchestrator/sf_dump_tool.py"
+    )
+    b = cic._fingerprint(
+        "ordereddict serialized as str", "orchestrator/sf_dump_tool.py"
+    )
+    assert a == b
+
+
+def test_skips_when_open_github_issue_with_same_title(monkeypatch):
+    """An already-open GitHub issue with the same title blocks a re-file even
+    when the ledger is empty (#303/#305, #328/#330 week-over-week regrowth)."""
+    monkeypatch.setattr(cic, "_read_memory_file", lambda path: "")
+    monkeypatch.setattr(cic, "_upsert_memory_file", lambda p, c: None)
+    monkeypatch.setattr(cic, "_admin_dm", lambda m: None)
+    monkeypatch.setattr(
+        cic,
+        "list_open_issues_with_label",
+        lambda label: ["[auto] code_fix: soql case rejected"],
+    )
+
+    classifications = [
+        {
+            "block_id": "SOQL CASE rejected by Salesforce",
+            "kind": "code_fix",
+            "fingerprint_terms": {
+                "error_pattern": "soql case rejected",
+                "file_path": "orchestrator/session_runner.py",
+                "proposed_action": "add runtime soql validator",
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        cic.client.messages,
+        "create",
+        MagicMock(return_value=_make_classification_response(classifications)),
+    )
+
+    gh_calls: List[Tuple[str, str]] = []
+    monkeypatch.setattr(cic, "_create_gh_issue", lambda t, b: gh_calls.append((t, b)))
+
+    _, issues_created, urls, ok = cic.create_issues_from_learnings()
+    assert ok is True
+    assert issues_created == 0
+    assert gh_calls == []

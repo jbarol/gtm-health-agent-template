@@ -1877,9 +1877,7 @@ def test_cleanup_known_orphans_marks_specific_session():
         patch.object(db, "_connect", return_value=fake_conn),
         patch.object(db, "DATABASE_URL", "postgres://test"),
     ):
-        transitioned = db.cleanup_known_orphans(
-            known_session_ids=("sesn_EXAMPLE",)
-        )
+        transitioned = db.cleanup_known_orphans(known_session_ids=("sesn_EXAMPLE",))
 
     # The known orphan was transitioned.
     assert transitioned == [4242]
@@ -1906,9 +1904,7 @@ def test_cleanup_known_orphans_no_op_when_session_not_running():
         patch.object(db, "_connect", return_value=fake_conn),
         patch.object(db, "DATABASE_URL", "postgres://test"),
     ):
-        transitioned = db.cleanup_known_orphans(
-            known_session_ids=("sesn_EXAMPLE",)
-        )
+        transitioned = db.cleanup_known_orphans(known_session_ids=("sesn_EXAMPLE",))
 
     assert transitioned == []
 
@@ -2977,3 +2973,191 @@ def test_sanitize_session_title_caps_full_string_not_just_question():
     result = sanitize_session_title(f"Ad-hoc: {long_q}")
     assert len(result) == 60
     assert result.startswith("Ad-hoc: ")
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (F3): SOQL error hint must only attach to dump_sf_query failures.
+# Issues #287, #290, #301, #313, #315, #326.
+# ---------------------------------------------------------------------------
+
+
+def test_db_query_exception_does_not_emit_soql_hint(monkeypatch):
+    import session_runner
+
+    monkeypatch.setattr(session_runner.db_adapter, "is_db_available", lambda: True)
+    monkeypatch.setattr(session_runner.db_adapter, "get_schema_snapshot", lambda: {})
+
+    def boom(sql):
+        raise RuntimeError("connection reset by peer")
+
+    monkeypatch.setattr(session_runner.db_adapter, "query", boom)
+    out = json.loads(
+        session_runner._dispatch_tool(
+            "db_query", {"sql": "SELECT id FROM opportunities"}, session_id="s-hint-1"
+        )
+    )
+    assert "error" in out
+    assert "soql" not in json.dumps(out).lower()
+
+
+def test_dump_sf_query_exception_keeps_soql_hint(monkeypatch):
+    import session_runner
+    import sf_dump_tool
+
+    def boom(*a, **k):
+        raise RuntimeError("Malformed request")
+
+    monkeypatch.setattr(sf_dump_tool, "dump_sf_query", boom)
+    out = json.loads(
+        session_runner._dispatch_tool(
+            "dump_sf_query",
+            {"soql": "SELECT Id FROM Lead", "portco_key": "fishbowl", "label": "x"},
+            session_id="s-hint-2",
+        )
+    )
+    assert "error" in out
+    assert "soql" in json.dumps(out).lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (F7): db_query surfaces classified DbQueryError, never bubbles raw.
+# Issues #283, #284, #310, #311.
+# ---------------------------------------------------------------------------
+
+
+def test_db_query_surfaces_classified_error_kind(monkeypatch):
+    import session_runner
+
+    monkeypatch.setattr(session_runner.db_adapter, "is_db_available", lambda: True)
+    monkeypatch.setattr(session_runner.db_adapter, "get_schema_snapshot", lambda: {})
+
+    def boom(sql):
+        raise session_runner.db_adapter.DbQueryError(
+            "connection", "connection lost mid-query: server closed"
+        )
+
+    monkeypatch.setattr(session_runner.db_adapter, "query", boom)
+    out = json.loads(
+        session_runner._dispatch_tool(
+            "db_query", {"sql": "SELECT id FROM opportunities"}, session_id="s-tax-1"
+        )
+    )
+    assert out["ok"] is False
+    assert out["error_kind"] == "connection"
+    assert "soql" not in json.dumps(out).lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (F2): circuit-break repeated identical failures + latch SF auth.
+# Issues #294, #295, #299, #319, #320, #324, #329.
+# ---------------------------------------------------------------------------
+
+
+def _reset_failure_state(sr):
+    sr._RECENT_FAILED_TOOL_CALLS.clear()
+    sr._TOOL_FAILURE_COUNTS.clear()
+    sr._AUTH_FAILED_SESSIONS.clear()
+
+
+def test_repeated_identical_failure_trips_circuit_breaker(monkeypatch):
+    import session_runner as sr
+
+    _reset_failure_state(sr)
+    monkeypatch.setattr(sr.db_adapter, "is_db_available", lambda: True)
+    monkeypatch.setattr(sr.db_adapter, "get_schema_snapshot", lambda: {})
+
+    def flaky(sql):
+        raise sr.db_adapter.DbQueryError("query", "column foo does not exist")
+
+    monkeypatch.setattr(sr.db_adapter, "query", flaky)
+    args = ("db_query", {"sql": "SELECT foo FROM opportunities"})
+    for _ in range(3):
+        sr._dispatch_tool(*args, session_id="s-cb")
+    out = json.loads(sr._dispatch_tool(*args, session_id="s-cb"))
+    assert out.get("error_kind") == "circuit_open"
+
+
+def test_sf_auth_failure_latches_session(monkeypatch):
+    import session_runner as sr
+    import sf_dump_tool
+
+    _reset_failure_state(sr)
+
+    def auth_boom(*a, **k):
+        raise RuntimeError("INVALID_SESSION_ID: Session expired or invalid")
+
+    monkeypatch.setattr(sf_dump_tool, "dump_sf_query", auth_boom)
+    sr._dispatch_tool(
+        "dump_sf_query",
+        {"soql": "SELECT Id FROM Lead", "portco_key": "fishbowl", "label": "x"},
+        session_id="s-auth",
+    )
+    # A DIFFERENT SF query in the same session must be aborted pre-dispatch.
+    out = json.loads(
+        sr._dispatch_tool(
+            "dump_sf_query",
+            {
+                "soql": "SELECT Name FROM Account",
+                "portco_key": "fishbowl",
+                "label": "y",
+            },
+            session_id="s-auth",
+        )
+    )
+    assert out.get("error_kind") == "auth_aborted"
+    assert "auth" in json.dumps(out).lower()
+
+
+def test_soql_syntax_error_with_column_position_does_not_latch(monkeypatch):
+    """A malformed-SOQL error that happens to contain 'Column:401' must NOT be
+    mistaken for an HTTP 401 auth failure and latch the session (codex review)."""
+    import session_runner as sr
+    import sf_dump_tool
+
+    _reset_failure_state(sr)
+
+    def syntax_boom(*a, **k):
+        raise RuntimeError("MALFORMED_QUERY: unexpected token at Row:1:Column:401")
+
+    monkeypatch.setattr(sf_dump_tool, "dump_sf_query", syntax_boom)
+    sr._dispatch_tool(
+        "dump_sf_query",
+        {"soql": "SELECT bogus FROM Lead", "portco_key": "fishbowl", "label": "x"},
+        session_id="s-noauth",
+    )
+    # A corrected query in the same session must NOT be aborted.
+    monkeypatch.setattr(
+        sf_dump_tool, "dump_sf_query", lambda *a, **k: {"file_path": None, "count": 0}
+    )
+    out = json.loads(
+        sr._dispatch_tool(
+            "dump_sf_query",
+            {"soql": "SELECT Id FROM Lead", "portco_key": "fishbowl", "label": "y"},
+            session_id="s-noauth",
+        )
+    )
+    assert out.get("error_kind") != "auth_aborted"
+
+
+# ---------------------------------------------------------------------------
+# Task 5 (F6a): generate_chart validates data.labels before rendering. #289.
+# ---------------------------------------------------------------------------
+
+
+def test_generate_chart_missing_labels_returns_clean_error():
+    import session_runner as sr
+
+    out = json.loads(
+        sr._dispatch_tool(
+            "generate_chart",
+            {
+                "chart_type": "bar",
+                "title": "T",
+                "data": {"datasets": [{"label": "x", "values": [1]}]},
+            },
+            session_id="s-chart",
+        )
+    )
+    assert out.get("ok") is False
+    assert "labels" in json.dumps(out).lower()
+    assert "soql" not in json.dumps(out).lower()

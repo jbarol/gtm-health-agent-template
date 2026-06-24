@@ -18,3 +18,5 @@ __pycache__/
 # Phase 1 scrub: real portco/vendor/operator names live here; gitignored.
 # See bin/scrub-portco-names.yml.example for the schema and onboarding.
 bin/scrub-portco-names.yml
+
+.venv/

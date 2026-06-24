@@ -45,7 +45,7 @@ import anthropic
 
 from _messages_usage import log_messages_usage
 from config import ANTHROPIC_API_KEY, HEALTH_STORE_ID
-from github_issue_helper import create_gh_issue
+from github_issue_helper import create_gh_issue, list_open_issues_with_label
 
 log = logging.getLogger(__name__)
 
@@ -258,13 +258,16 @@ def _normalize(s: str) -> str:
     return s
 
 
-def _fingerprint(error_pattern: str, file_path: str, proposed_action: str) -> str:
-    """Compute the fingerprint over (normalized error pattern, file path, proposed action)."""
-    payload = (
-        f"{_normalize(error_pattern)}::"
-        f"{_normalize(file_path)}::"
-        f"{_normalize(proposed_action)}"
-    )
+def _fingerprint(error_pattern: str, file_path: str) -> str:
+    """Compute the fingerprint over (normalized error pattern, file path).
+
+    ``proposed_action`` was dropped from the key (was a 3-tuple) because the
+    classifier's free-text action phrasing drifts run-to-run ("add a runtime
+    soql validator" vs "add runtime soql validator"), minting a fresh
+    fingerprint for the SAME root-cause bug. That is exactly how #303/#305 and
+    #328/#330 escaped dedup. Keying on (error, file) collapses them.
+    """
+    payload = f"{_normalize(error_pattern)}::{_normalize(file_path)}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -557,6 +560,16 @@ def create_issues_from_learnings() -> Tuple[int, int, List[str], bool]:
     # observations in the same source don't both create issues.
     minted_this_run: set[str] = set()
 
+    # Dedup against issues ALREADY OPEN on GitHub (#303/#305, #328/#330). The
+    # ledger only remembers what THIS pipeline created; an issue opened on a
+    # prior week (or closed-then-reopened, or hand-filed) was invisible, so the
+    # same bug got re-filed every Saturday. Fetch open titles once and skip any
+    # match. Returns [] on gh failure — a transient error must not block the
+    # cron, just degrade dedup to ledger-only for this run.
+    open_issue_titles = {
+        t.strip().lower() for t in list_open_issues_with_label(_ISSUE_LABELS)
+    }
+
     for entry in classifications:
         if not isinstance(entry, dict):
             continue
@@ -565,8 +578,7 @@ def create_issues_from_learnings() -> Tuple[int, int, List[str], bool]:
         terms = entry.get("fingerprint_terms") or {}
         error_pattern = (terms.get("error_pattern") or "").strip()
         file_path = (terms.get("file_path") or "").strip()
-        proposed_action = (terms.get("proposed_action") or "").strip()
-        if not (error_pattern and file_path and proposed_action):
+        if not (error_pattern and file_path):
             log.info(
                 "codefix_issue_creator: skipping code_fix block %r with "
                 "incomplete fingerprint terms",
@@ -574,11 +586,19 @@ def create_issues_from_learnings() -> Tuple[int, int, List[str], bool]:
             )
             continue
 
-        fingerprint = _fingerprint(error_pattern, file_path, proposed_action)
+        fingerprint = _fingerprint(error_pattern, file_path)
         if fingerprint in seen_fingerprints or fingerprint in minted_this_run:
             log.info(
                 "codefix_issue_creator: fingerprint %s already created — skipping",
                 fingerprint[:16],
+            )
+            continue
+
+        title = _build_issue_title(error_pattern)
+        if title.strip().lower() in open_issue_titles:
+            log.info(
+                "codefix_issue_creator: issue %r already open on GitHub — skipping",
+                title,
             )
             continue
 
@@ -592,7 +612,6 @@ def create_issues_from_learnings() -> Tuple[int, int, List[str], bool]:
             )
             continue
 
-        title = _build_issue_title(error_pattern)
         body = _build_issue_body(block_id, block_text, fingerprint)
         url = _create_gh_issue(title, body)
         if url is None:

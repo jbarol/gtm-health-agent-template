@@ -2157,3 +2157,30 @@ def test_post_report_cancelled_guard_drains_stale_marker_when_not_fired_this_tur
         "stale cancelled-guard marker leaked past _dispatch_post_report"
     )
     assert session_runner._consume_post_report_cancelled_guard(sid) is False
+
+
+# ---------------------------------------------------------------------------
+# Task 6 (F6b): a JSON-string payload is auto-recovered to a dict. #292, #317.
+# ---------------------------------------------------------------------------
+
+
+def test_post_report_recovers_json_string_payload():
+    from session_runner import _dispatch_post_report
+
+    payload = {
+        "metric": "Win rate",
+        "value": "23%",
+        "as_of": "2026-06-24",
+        "source": "Salesforce",
+    }
+    # The agent intermittently sends json.dumps(dict) instead of the dict.
+    tool_input = {"response_type": "quick_answer", "payload": json.dumps(payload)}
+
+    with patch("session_runner.send_notification") as mock_send:
+        mock_send.return_value = "ts-jsonstr"
+        result_text = _dispatch_post_report(
+            tool_input, thread_ts="t-jsonstr", session_id="sess-jsonstr"
+        )
+
+    result = json.loads(result_text)
+    assert result["ok"] is True

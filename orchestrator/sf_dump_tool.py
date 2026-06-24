@@ -72,6 +72,7 @@ On error::
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -367,6 +368,26 @@ def _strip_sf_attributes(record: dict) -> dict:
     return record
 
 
+# Only unquote a date literal that follows a RELATIONAL operator (>, <, >=, <=).
+# Date columns are range-compared; a quoted date there 400s and is the bug we
+# fix. Equality (``=``) is left alone on purpose: a TEXT field can legitimately
+# hold a date-looking string (e.g. ``Campaign_Code__c = '2024-01-01'``) and
+# unquoting that would corrupt a valid filter (codex review, 2026-06-24).
+_SOQL_QUOTED_DATE_RE = _re.compile(r"([<>]=?\s*)'(\d{4}-\d{2}-\d{2}(?:T[\d:.+Z-]*)?)'")
+
+
+def _unquote_soql_date_literals(soql: str) -> str:
+    """Strip surrounding single quotes from ISO date/datetime literals that are
+    range-compared in a SOQL WHERE clause. SOQL date literals are bare by spec;
+    quoting them 400s. Only ``<op> 'YYYY-MM-DD[T...]'`` (op in >, <, >=, <=) is
+    touched — equality comparisons and other string literals are left intact so
+    a text field holding a date-like value isn't corrupted."""
+    repaired = _SOQL_QUOTED_DATE_RE.sub(r"\1\2", soql)
+    if repaired != soql:
+        log.info("[SOQL_DATE_REPAIR] unquoted date literal(s) in SOQL")
+    return repaired
+
+
 def _parse_soql_relationship_fields(soql: str) -> dict[str, list[str]]:
     """Extract ``Parent.Child`` relationship fields from a SOQL ``SELECT`` clause.
 
@@ -485,6 +506,23 @@ def _flatten_sf_relationships(
     flat: dict = {}
     expected = expected_relationships or {}
     for key, value in record.items():
+        if isinstance(value, dict) and "records" in value and "totalSize" in value:
+            # Salesforce child/aggregate subquery envelope — e.g.
+            # ``(SELECT Id, Name FROM Contacts)`` returns
+            # ``{"totalSize": N, "done": bool, "records": [...]}``. The comma-
+            # split SOQL parser never captures these as relationships, so before
+            # this branch they fell through to the generic dict path and the
+            # ``records`` LIST was written as a Python repr (#328, #330). Emit a
+            # queryable ``<Parent>_count`` int and a ``<Parent>_json`` JSON
+            # string instead — both DuckDB- and pandas-readable.
+            child_records = value.get("records") or []
+            cleaned = [
+                {k: v for k, v in (rec or {}).items() if k != "attributes"}
+                for rec in child_records
+            ]
+            flat[f"{key}_count"] = value.get("totalSize", len(cleaned))
+            flat[f"{key}_json"] = json.dumps(cleaned, default=str)
+            continue
         if key in expected:
             # Pre-declared relationship: always emit the Parent_Child columns,
             # whether the relationship is populated, null, or missing. This
@@ -560,9 +598,15 @@ def _coerce_for_parquet(value: Any, dtype: str) -> Any:
             return _coerce_iso_date(value)
         if dtype == "datetime":
             return _coerce_iso_datetime(value)
-        # str / null: stringify safely.
+        # str / null: JSON-encode containers so a stray dict/list (an
+        # unflattened relationship or OrderedDict) is queryable JSON, never a
+        # Python repr like ``OrderedDict([...])`` (#303, #305, #325).
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, default=str)
         return str(value)
     except (TypeError, ValueError):
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, default=str)
         return str(value)
 
 
@@ -904,6 +948,12 @@ def dump_sf_query(
         # Includes SalesforceAuthenticationFailed, missing-credential
         # RuntimeError from _get_sf_client, network failures, etc.
         return _empty_error_result(f"sf_auth_failed: {e}", expand=expand)
+
+    # Auto-unquote SOQL date/datetime literals (#296, #298, #321, #323). SF's
+    # REST API rejects quoted ISO dates in WHERE clauses (CreatedDate >=
+    # '2024-01-01' → 400). String literals (Status = 'Open') keep their quotes.
+    # Repairing here turns a guaranteed 400-and-retry loop into a clean read.
+    soql = _unquote_soql_date_literals(soql)
 
     # Parse SOQL once so the flattener can emit consistent ``Parent_Child``
     # column names even when early rows have a null relationship. Without

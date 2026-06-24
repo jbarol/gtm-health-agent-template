@@ -55,24 +55,46 @@ Auto-generated improvements from session reviews.
 """
 
 
-VALID_DIFF = """--- a/agents/setup_agents.py
-+++ b/agents/setup_agents.py
-@@ -1,3 +1,3 @@
--old line one
-+new line one
- second line
- third line
-"""
+# A small stand-in for agents/setup_agents.py that the edits below anchor to.
+SAMPLE_SETUP_SOURCE = '''\
+pipeline_monitor = client.beta.agents.create(
+    name="Pipeline Monitor",
+    model="claude-sonnet-4-6",
+    system="""\\
+You are the Pipeline Monitor.
+
+## Verifying tool access
+Verify MCP by calling soqlQuery.
+""",
+)
+'''
+
+# Valid search/replace edits whose old_string appears exactly once in
+# SAMPLE_SETUP_SOURCE.
+VALID_EDITS_JSON = (
+    '[{"old_string": "Verify MCP by calling soqlQuery.", '
+    '"new_string": "Verify MCP by calling soqlQuery, not by filesystem '
+    'inspection."}]'
+)
 
 
 @pytest.fixture(autouse=True)
 def isolate_module(monkeypatch):
     """Replace the global Anthropic client with a stub so no network calls
-    happen in any test. Individual tests can monkeypatch deeper as needed.
+    happen in any test, and isolate setup_agents.py I/O from the real file.
+    Individual tests can monkeypatch deeper as needed.
     """
     monkeypatch.setattr(ppp, "client", _StubAnthropicClient())
     monkeypatch.setattr(ppp, "_admin_dm", lambda msg: None)
     monkeypatch.setattr(ppp, "log_messages_usage", lambda *a, **kw: None, raising=False)
+
+    # Isolate from the real agents/setup_agents.py: reads return the sample,
+    # writes are captured. Tests that need other source override these.
+    written: dict[str, str] = {}
+    monkeypatch.setattr(ppp, "_read_setup_agents", lambda: SAMPLE_SETUP_SOURCE)
+    monkeypatch.setattr(
+        ppp, "_write_setup_agents", lambda text: written.__setitem__("text", text)
+    )
 
     # cost_collector.track_messages_call → no-op so we don't hit the DB.
     import cost_collector
@@ -107,7 +129,8 @@ class _StubAnthropicClient:
     def __init__(self):
         self._mem: dict[str, _StubMemoryItem] = {}
         self.messages_calls: list[dict] = []
-        self.next_diff: str = VALID_DIFF
+        # Raw text the stubbed model returns; default is a valid edits payload.
+        self.next_diff: str = VALID_EDITS_JSON
         self.beta = types.SimpleNamespace(
             memory_stores=types.SimpleNamespace(
                 memories=types.SimpleNamespace(
@@ -259,19 +282,17 @@ def test_all_patches_already_applied(monkeypatch):
     assert recorder.calls == []
 
 
-def test_invalid_diff_no_pr(monkeypatch):
-    """Sonnet returns a diff that fails ``git apply --check``."""
+def test_unfindable_edit_no_pr(monkeypatch):
+    """Sonnet returns an edit whose old_string isn't in setup_agents.py →
+    abort cleanly, no PR, ledger untouched."""
     monkeypatch.setattr(ppp, "client", _StubAnthropicClient())
     ppp.client.seed(ppp.PATCHES_PATH, SAMPLE_PATCHES)
-    ppp.client.next_diff = "this is not a valid diff"
+    ppp.client.next_diff = (
+        '[{"old_string": "this text is not in the file at all", '
+        '"new_string": "whatever"}]'
+    )
 
     recorder = _SubprocessRecorder()
-    # git apply --check returns 1.
-    recorder.set(
-        ["git", "apply", "--check"],
-        returncode=1,
-        stderr="error: patch does not apply",
-    )
     monkeypatch.setattr(ppp, "_run_subprocess", recorder)
 
     seen, applied, pr_url, ok = ppp.promote_prompt_patches()
@@ -283,6 +304,24 @@ def test_invalid_diff_no_pr(monkeypatch):
     # gh pr create NOT called.
     assert not any(c[:3] == ["gh", "pr", "create"] for c in recorder.calls)
     # Applied ledger NOT updated (no entry for APPLIED_PATH at all).
+    assert ppp.APPLIED_PATH not in ppp.client._mem
+
+
+def test_no_usable_edits_no_pr(monkeypatch):
+    """Sonnet returns non-JSON / no array → no edits, no PR, ledger untouched."""
+    monkeypatch.setattr(ppp, "client", _StubAnthropicClient())
+    ppp.client.seed(ppp.PATCHES_PATH, SAMPLE_PATCHES)
+    ppp.client.next_diff = "Sorry, I could not produce edits."
+
+    recorder = _SubprocessRecorder()
+    monkeypatch.setattr(ppp, "_run_subprocess", recorder)
+
+    seen, applied, pr_url, ok = ppp.promote_prompt_patches()
+
+    assert ok is False
+    assert applied == 0
+    assert pr_url is None
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in recorder.calls)
     assert ppp.APPLIED_PATH not in ppp.client._mem
 
 
@@ -414,3 +453,42 @@ def test_mark_applied_appends_without_clobbering(monkeypatch):
     assert "a" * 64 in stored
     assert "b" * 64 in stored
     assert "https://example.com/pr/2" in stored
+
+
+def test_parse_edits_extracts_array_with_fence_and_preamble():
+    text = 'Here are the edits:\n```json\n[{"old_string": "a", "new_string": "b"}]\n```'
+    edits = ppp._parse_edits(text)
+    assert edits == [{"old_string": "a", "new_string": "b"}]
+
+
+def test_parse_edits_returns_empty_on_garbage():
+    assert ppp._parse_edits("not json at all") == []
+    assert ppp._parse_edits("") == []
+    # Array of non-edit objects → dropped.
+    assert ppp._parse_edits('[{"foo": "bar"}]') == []
+
+
+def test_apply_edits_to_text_replaces_unique_anchor():
+    src = "alpha\nVERIFY MCP HERE\nomega\n"
+    out = ppp._apply_edits_to_text(
+        src, [{"old_string": "VERIFY MCP HERE", "new_string": "VERIFY MCP, not ls"}]
+    )
+    assert "VERIFY MCP, not ls" in out
+    assert "VERIFY MCP HERE" not in out
+
+
+def test_apply_edits_to_text_raises_when_anchor_missing():
+    with pytest.raises(ppp._PromoterError) as exc:
+        ppp._apply_edits_to_text(
+            "hello world", [{"old_string": "nope", "new_string": "x"}]
+        )
+    msg = str(exc.value)
+    assert "not found" in msg
+    assert "Applied ledger NOT updated" in msg
+
+
+def test_apply_edits_to_text_raises_on_ambiguous_anchor():
+    src = "dup\ndup\n"
+    with pytest.raises(ppp._PromoterError) as exc:
+        ppp._apply_edits_to_text(src, [{"old_string": "dup", "new_string": "x"}])
+    assert "ambiguous" in str(exc.value)
