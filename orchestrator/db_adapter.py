@@ -977,15 +977,44 @@ def _connect():
     return psycopg2.connect(DATABASE_URL)
 
 
+class DbQueryError(Exception):
+    """A db_query failure with a classified ``kind``.
+
+    Kinds (#283, #284, #310, #311):
+      - ``unavailable``: the database could not be reached at all.
+      - ``connection``: connection dropped mid-query (retryable).
+      - ``permission``: the role lacks privilege (not retryable).
+      - ``query``: the SQL itself is wrong — bad column/table/syntax.
+
+    The classification lets the dispatcher surface an actionable message
+    and lets the circuit breaker decide whether a retry could ever succeed.
+    """
+
+    def __init__(self, kind: str, message: str):
+        self.kind = kind
+        super().__init__(message)
+
+
 def query(sql: str, params: tuple = None) -> dict:
+    import psycopg2
     import psycopg2.extras
 
-    conn = _connect()
+    try:
+        conn = _connect()
+    except psycopg2.OperationalError as e:
+        raise DbQueryError("unavailable", f"database unavailable: {e}") from e
+
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
             return {"records": [dict(r) for r in rows], "totalSize": len(rows)}
+    except psycopg2.OperationalError as e:
+        raise DbQueryError("connection", f"connection lost mid-query: {e}") from e
+    except psycopg2.errors.InsufficientPrivilege as e:
+        raise DbQueryError("permission", f"permission denied: {e}") from e
+    except psycopg2.Error as e:
+        raise DbQueryError("query", f"query failed: {e}") from e
     finally:
         conn.close()
 
@@ -1749,9 +1778,7 @@ def _aggregate_snapshot_metrics(cur, snapshot_id: int, snap_date) -> dict:
         (snapshot_id,),
     )
     a = cur.fetchone()
-    cur.execute(
-        "SELECT COUNT(*) FROM contacts WHERE snapshot_id = %s", (snapshot_id,)
-    )
+    cur.execute("SELECT COUNT(*) FROM contacts WHERE snapshot_id = %s", (snapshot_id,))
     c = cur.fetchone()
 
     return {

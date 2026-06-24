@@ -591,3 +591,15 @@ def test_cast_to_array_type_passes():
     """``::int[]`` is a valid Postgres array-type cast."""
     sql = "SELECT id::int[] FROM opportunities"
     assert validate_sql(sql, SCHEMA) == {"ok": True}
+
+
+def test_case_expression_passes_validator():
+    """Regression for #297/#322: CASE was never actually rejected by the
+    validator — the "case expression rejected" errors were the SOQL-hint
+    bleed (Task 1) misattributing the failure. This guards that CASE keeps
+    passing so the misdiagnosis can't recur."""
+    sql = (
+        "SELECT id, CASE WHEN amount > 1000 THEN 'big' ELSE 'small' END AS bucket "
+        "FROM opportunities"
+    )
+    assert validate_sql(sql, SCHEMA)["ok"] is True

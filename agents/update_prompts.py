@@ -260,6 +260,13 @@ When in doubt, ask Pipeline Monitor / Sales Monitor / Post-Sales Monitor — the
 
 <output_format>
 Final reports MUST go through post_report (NOT send_slack_notification).
+Writing to a container file with the Python/files/bash built-ins is SCRATCH
+space only — those files are ephemeral (lost on the next deploy) and the user
+never sees them. There is no "write the report to a file" delivery fallback:
+the ONLY way output reaches the user is post_report. Any artifact you want
+attached must be written to /mnt/session/outputs (via dump_sf_query /
+materialize_xlsx) and passed in payload.attachments — a file anywhere else is
+not attachable.
 Required arguments:
 - response_type: one of "ad_hoc_investigation_result", "anomaly_alert", "nightly_digest", "weekly_status"
 - payload: JSON matching the schema for the chosen response_type

@@ -14,6 +14,7 @@ from config import (
 )
 from feedback_capture import Signal
 from prose_polish import polish as _plain_english
+from slack_redact import redact_paths
 
 log = logging.getLogger(__name__)
 
@@ -2561,7 +2562,7 @@ def post_analysis(
     }.get(severity, ":white_circle:")
 
     mentions = " ".join(f"<@{uid}>" for uid in SLACK_NOTIFY_USER_IDS if uid)
-    slack_text = _md_to_slack(analysis_text)
+    slack_text = _md_to_slack(redact_paths(analysis_text))
 
     # Main message with title
     header_block = {
@@ -2766,8 +2767,9 @@ def send_notification(
     else:
         mentions = " ".join(f"<@{uid}>" for uid in SLACK_NOTIFY_USER_IDS if uid)
 
-    summary = _md_to_slack(summary)
-    detail = _md_to_slack(detail) if detail else ""
+    # Redact absolute container paths before they reach the channel (#293, #318).
+    summary = _md_to_slack(redact_paths(summary))
+    detail = _md_to_slack(redact_paths(detail)) if detail else ""
 
     text_content = f"{emoji} *{label}* — {summary}"
     blocks = [

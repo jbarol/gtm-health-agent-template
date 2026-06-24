@@ -439,6 +439,28 @@ _DUPLICATE_RETRY_TTL_SECONDS = 10
 _RECENT_FAILED_TOOL_CALLS: dict[tuple[str, str, str], dict] = {}
 _recent_failed_tool_calls_lock = threading.Lock()
 
+# Circuit breaker (#299, #324). Persistent per-session count of how many times
+# an identical (tool, input) call has failed — including attempts blocked by
+# the duplicate-retry window above. NOT TTL-swept: a model hammering the same
+# broken query slowly (one retry every 6s) must still trip the breaker. Once
+# the count reaches _MAX_IDENTICAL_FAILURES the call is refused outright so the
+# session stops burning tokens on an unrecoverable error.
+_MAX_IDENTICAL_FAILURES = 3
+_TOOL_FAILURE_COUNTS: dict[tuple[str, str, str], int] = {}
+
+# Salesforce auth latch (#294, #295, #319, #320). Once an SF read fails with an
+# auth/session error, every subsequent SF read in the session is aborted
+# pre-dispatch — re-auth never happens mid-session, so retrying is pure waste.
+_AUTH_FAILED_SESSIONS: set[str] = set()
+_SF_AUTH_SIGNALS = (
+    "sf_auth_failed",
+    "invalid_session_id",
+    "authentication failure",
+    "401",
+    "insufficient_access",
+)
+_SF_TOOLS = ("dump_sf_query",)
+
 
 def _tool_input_hash(tool_input: dict) -> str:
     """Stable SHA-256 hash of a tool input dict.
@@ -527,6 +549,84 @@ def _register_failed_tool_call(
         prior = _RECENT_FAILED_TOOL_CALLS.get(key)
         count = (prior["count"] + 1) if prior else 1
         _RECENT_FAILED_TOOL_CALLS[key] = {"timestamp": now, "count": count}
+
+
+def _bump_failure_count(
+    session_id: Optional[str], tool_name: str, tool_input: dict
+) -> None:
+    """Increment the persistent identical-failure counter for the circuit
+    breaker. Counts both real failures and duplicate-retry-blocked attempts —
+    a slow hammer trips the breaker just like a fast one. No-op without a
+    session_id."""
+    if not session_id:
+        return
+    key = (session_id, tool_name, _tool_input_hash(tool_input))
+    with _recent_failed_tool_calls_lock:
+        _TOOL_FAILURE_COUNTS[key] = _TOOL_FAILURE_COUNTS.get(key, 0) + 1
+
+
+def _circuit_open(
+    session_id: Optional[str], tool_name: str, tool_input: dict
+) -> Optional[str]:
+    """Return a circuit-open error JSON if this exact call has already failed
+    ``_MAX_IDENTICAL_FAILURES`` times this session, else None."""
+    if not session_id:
+        return None
+    key = (session_id, tool_name, _tool_input_hash(tool_input))
+    with _recent_failed_tool_calls_lock:
+        count = _TOOL_FAILURE_COUNTS.get(key, 0)
+    if count < _MAX_IDENTICAL_FAILURES:
+        return None
+    log.warning(
+        "[CIRCUIT_OPEN] tool=%s session=%s failures=%d — refusing further retries",
+        tool_name,
+        session_id,
+        count,
+    )
+    msg = (
+        f"{tool_name} has failed {count}x with this exact input. Halting retries "
+        f"— change the input or approach. Do NOT call it again unchanged."
+    )
+    if tool_name == "db_query":
+        msg += (
+            " If this was a schema mismatch (unknown column/table), discover the "
+            "schema once before re-querying."
+        )
+    return json.dumps({"ok": False, "error": msg, "error_kind": "circuit_open"})
+
+
+def _auth_latched(session_id: Optional[str], tool_name: str) -> Optional[str]:
+    """Return an abort error JSON if this session has a latched Salesforce auth
+    failure and the tool is an SF read, else None."""
+    if not session_id or tool_name not in _SF_TOOLS:
+        return None
+    with _recent_failed_tool_calls_lock:
+        latched = session_id in _AUTH_FAILED_SESSIONS
+    if not latched:
+        return None
+    log.warning("[AUTH_ABORTED] tool=%s session=%s", tool_name, session_id)
+    return json.dumps(
+        {
+            "ok": False,
+            "error": (
+                "Salesforce auth failed earlier this session — aborting further "
+                "SF reads. Re-auth does not happen mid-session."
+            ),
+            "error_kind": "auth_aborted",
+        }
+    )
+
+
+def _maybe_latch_auth_failure(
+    session_id: Optional[str], tool_name: str, result_json: str
+) -> None:
+    """Latch the session if an SF tool failed with an auth/session error."""
+    if not session_id or tool_name not in _SF_TOOLS:
+        return
+    if _SF_AUTH_SIGNALS and any(sig in result_json.lower() for sig in _SF_AUTH_SIGNALS):
+        with _recent_failed_tool_calls_lock:
+            _AUTH_FAILED_SESSIONS.add(session_id)
+        log.warning("[AUTH_LATCH] session=%s latched after SF auth failure", session_id)
 
 
 def _result_is_error(result_json: str) -> bool:
@@ -1228,6 +1328,7 @@ MEMORY_RESOURCES = [
     },
 ]
 
+
 # Kapa is a REST custom tool (see orchestrator/kapa_rest_tool.py); it does
 # not require a vault at session create time. Only SF + Slack vaults attach.
 def _collect_vault_ids() -> list:
@@ -1326,11 +1427,26 @@ def _dispatch_tool(
     message so the lifecycle reaction (👁 → ⏰ → ✅/❌) can be flipped
     on the right message at the post_report success boundary.
     """
+    # Salesforce auth latch (#294, #295, #319, #320): once SF auth has failed
+    # this session, refuse further SF reads before they waste a round-trip.
+    aborted = _auth_latched(session_id, tool_name)
+    if aborted is not None:
+        return aborted
+
+    # Circuit breaker (#299, #324): refuse a call that has already failed
+    # identically _MAX_IDENTICAL_FAILURES times this session.
+    tripped = _circuit_open(session_id, tool_name, tool_input)
+    if tripped is not None:
+        return tripped
+
     # PR 10: short-circuit when the same tool call failed for this session
     # within the duplicate-retry window. The agent's prompt is instructed
     # to serialize retries; this is the orchestrator-side enforcement.
     blocked = _check_duplicate_retry(session_id, tool_name, tool_input)
     if blocked is not None:
+        # A blocked duplicate still counts toward the circuit breaker — a slow
+        # hammer must trip it just like a fast one.
+        _bump_failure_count(session_id, tool_name, tool_input)
         return blocked
 
     result = _dispatch_tool_impl(
@@ -1347,6 +1463,8 @@ def _dispatch_tool(
     )
     if _result_is_error(result):
         _register_failed_tool_call(session_id, tool_name, tool_input)
+        _bump_failure_count(session_id, tool_name, tool_input)
+        _maybe_latch_auth_failure(session_id, tool_name, result)
     return result
 
 
@@ -1424,7 +1542,13 @@ def _dispatch_tool_impl(
 
         elif tool_name == "db_query":
             if not db_adapter.is_db_available():
-                return json.dumps({"error": "Database not available"})
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "Database not available",
+                        "error_kind": "unavailable",
+                    }
+                )
             sql = tool_input["sql"].strip()
             # Read-only guard: SELECT and WITH (CTE-prefixed SELECT) are
             # both allowed. The validator below enforces the same
@@ -1452,7 +1576,15 @@ def _dispatch_tool_impl(
                     validation.get("error"),
                 )
                 return json.dumps(validation)
-            result = db_adapter.query(sql)
+            try:
+                result = db_adapter.query(sql)
+            except db_adapter.DbQueryError as e:
+                # Classified failure (connection/permission/query/unavailable)
+                # surfaced as a structured result instead of an opaque psycopg2
+                # exception (#283, #284, #310, #311). The circuit breaker keys
+                # off the stable error text; the model gets an actionable kind.
+                log.warning("db_query failed (%s): %s", e.kind, e)
+                return json.dumps({"ok": False, "error": str(e), "error_kind": e.kind})
             records = result.get("records") or []
             # B3: virtualize any list-shaped result above the threshold.
             # Keeps massive result sets out of the model's context — the model
@@ -1474,6 +1606,20 @@ def _dispatch_tool_impl(
             return json.dumps(result, default=str)
 
         elif tool_name == "generate_chart":
+            # Validate the required data.labels up front (#289). Without this a
+            # missing labels field raised a bare KeyError deep in the renderer,
+            # which surfaced as an opaque (and previously SOQL-tagged) error.
+            if not (tool_input.get("data") or {}).get("labels"):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": (
+                            "generate_chart requires data.labels — a non-empty "
+                            "list of category labels (x-axis / pie segments)."
+                        ),
+                        "tool": "generate_chart",
+                    }
+                )
             chart_bytes = _render_chart_bytes(tool_input)
             reply_to = tool_input.get("reply_to") or thread_ts
             ts = post_chart_file(
@@ -1770,13 +1916,18 @@ def _dispatch_tool_impl(
 
     except Exception as e:
         log.error(f"Tool {tool_name} failed: {e}")
-        return json.dumps(
-            {
-                "error": str(e),
-                "tool": tool_name,
-                "hint": "Revise your query and try again. SOQL does not support CASE, COALESCE, or subqueries in SELECT.",
-            }
-        )
+        err = {"error": str(e), "tool": tool_name}
+        # The SOQL grammar hint is ONLY correct for Salesforce reads. Attaching
+        # it to db_query (Postgres), generate_chart (QuickChart), query_artifact
+        # (DuckDB), or arbitrary Python exceptions sent the model chasing a
+        # nonexistent SOQL problem (#287, #290, #301, #313, #315, #326).
+        if tool_name == "dump_sf_query":
+            err["hint"] = (
+                "Revise your SOQL and try again. SOQL does not support CASE, "
+                "COALESCE, or subqueries in SELECT, and date/datetime literals "
+                "are UNquoted (CreatedDate >= 2024-01-01T00:00:00Z)."
+            )
+        return json.dumps(err)
 
 
 def _virtualize_tool_result(
@@ -2634,6 +2785,15 @@ def _dispatch_post_report(
         tool_input.get("response_type") if isinstance(tool_input, dict) else None
     )
     payload = tool_input.get("payload") if isinstance(tool_input, dict) else None
+    # Auto-recover a JSON-string payload (#292, #317). The agent intermittently
+    # sends ``json.dumps(dict)`` instead of the dict itself; parse it back so a
+    # well-formed report isn't lost to a serialization slip. A genuinely-bad
+    # string still falls through to the isinstance(payload, dict) guard below.
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            pass
     reply_to = (
         tool_input.get("reply_to") if isinstance(tool_input, dict) else None
     ) or thread_ts

@@ -20,6 +20,7 @@ Run::
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -1177,3 +1178,124 @@ def test_summary_interesting_columns_includes_lead_funnel_fields():
     """
     assert "Status" in sf_dump_tool._SUMMARY_INTERESTING_COLUMNS
     assert "LeadSource" in sf_dump_tool._SUMMARY_INTERESTING_COLUMNS
+
+
+# ---------------------------------------------------------------------------
+# Task 4 (F1): SF child/aggregate subqueries flatten to count + JSON column;
+# no dict/list ever lands as a Python repr in the Parquet artifact.
+# Issues #300, #303, #304, #305, #325, #328, #329, #330.
+# ---------------------------------------------------------------------------
+
+
+def test_child_subquery_flattens_to_json_and_count(tmp_path: Path):
+    rows = [
+        {
+            "Id": "001A",
+            "Name": "Acme",
+            "Contacts": {
+                "totalSize": 2,
+                "done": True,
+                "records": [
+                    {"attributes": {"type": "Contact"}, "Id": "003A", "Name": "Ann"},
+                    {"attributes": {"type": "Contact"}, "Id": "003B", "Name": "Bob"},
+                ],
+            },
+        }
+    ]
+    with patch.object(
+        sf_dump_tool,
+        "_iter_records",
+        side_effect=lambda c, q: iter(
+            [{"attributes": {"type": "Account"}, **r} for r in rows]
+        ),
+    ):
+        with patch("session_runner._get_sf_client", return_value=_FakeSfClient(rows)):
+            res = sf_dump_tool.dump_sf_query(
+                soql="SELECT Id, Name, (SELECT Id, Name FROM Contacts) FROM Account",
+                portco_key="fishbowl",
+                label="acct_children",
+                output_dir=str(tmp_path),
+            )
+    assert "Contacts_count" in res["schema"]
+    assert "Contacts_json" in res["schema"]
+    table = pq.read_table(res["file_path"]).to_pydict()
+    assert table["Contacts_count"] == [2]
+    parsed = json.loads(table["Contacts_json"][0])
+    assert parsed[0]["Name"] == "Ann"
+    # The Python-repr leak must be gone.
+    assert "OrderedDict" not in table["Contacts_json"][0]
+    assert "attributes" not in table["Contacts_json"][0]
+
+
+def test_coerce_for_parquet_json_encodes_dict():
+    out = sf_dump_tool._coerce_for_parquet({"a": 1}, "str")
+    assert out == '{"a": 1}'
+    assert "OrderedDict" not in out
+
+
+def test_coerce_for_parquet_json_encodes_list():
+    out = sf_dump_tool._coerce_for_parquet([1, {"b": 2}], "str")
+    assert json.loads(out) == [1, {"b": 2}]
+
+
+# ---------------------------------------------------------------------------
+# Task 8 (F4): quoted SOQL date literals are auto-unquoted before submission.
+# Issues #296, #298, #321, #323.
+# ---------------------------------------------------------------------------
+
+
+def test_soql_quoted_date_literal_is_unquoted(tmp_path: Path):
+    captured = {}
+
+    def fake_iter(client, soql):
+        captured["soql"] = soql
+        return iter([])
+
+    with patch.object(sf_dump_tool, "_iter_records", side_effect=fake_iter):
+        with patch("session_runner._get_sf_client", return_value=_FakeSfClient([])):
+            sf_dump_tool.dump_sf_query(
+                soql="SELECT Id FROM Lead WHERE CreatedDate >= '2024-01-01T00:00:00Z'",
+                portco_key="fishbowl",
+                label="dl",
+                output_dir=str(tmp_path),
+            )
+    assert "'2024-01-01T00:00:00Z'" not in captured["soql"]
+    assert "2024-01-01T00:00:00Z" in captured["soql"]
+
+
+def test_soql_quoted_plain_date_is_unquoted(tmp_path: Path):
+    captured = {}
+
+    def fake_iter(client, soql):
+        captured["soql"] = soql
+        return iter([])
+
+    with patch.object(sf_dump_tool, "_iter_records", side_effect=fake_iter):
+        with patch("session_runner._get_sf_client", return_value=_FakeSfClient([])):
+            sf_dump_tool.dump_sf_query(
+                soql="SELECT Id FROM Opportunity WHERE CloseDate <= '2024-12-31'",
+                portco_key="fishbowl",
+                label="dl2",
+                output_dir=str(tmp_path),
+            )
+    assert "'2024-12-31'" not in captured["soql"]
+    assert "2024-12-31" in captured["soql"]
+
+
+def test_soql_string_literal_quotes_preserved(tmp_path: Path):
+    """Non-date string literals must KEEP their quotes."""
+    captured = {}
+
+    def fake_iter(client, soql):
+        captured["soql"] = soql
+        return iter([])
+
+    with patch.object(sf_dump_tool, "_iter_records", side_effect=fake_iter):
+        with patch("session_runner._get_sf_client", return_value=_FakeSfClient([])):
+            sf_dump_tool.dump_sf_query(
+                soql="SELECT Id FROM Lead WHERE Status = 'Open'",
+                portco_key="fishbowl",
+                label="dl3",
+                output_dir=str(tmp_path),
+            )
+    assert "'Open'" in captured["soql"]
