@@ -1299,3 +1299,23 @@ def test_soql_string_literal_quotes_preserved(tmp_path: Path):
                 output_dir=str(tmp_path),
             )
     assert "'Open'" in captured["soql"]
+
+
+def test_soql_date_like_text_equality_quotes_preserved(tmp_path: Path):
+    """A date-LOOKING value compared with ``=`` (a text field) keeps its quotes
+    — only relational comparisons (date ranges) get unquoted (codex review)."""
+    captured = {}
+
+    def fake_iter(client, soql):
+        captured["soql"] = soql
+        return iter([])
+
+    with patch.object(sf_dump_tool, "_iter_records", side_effect=fake_iter):
+        with patch("session_runner._get_sf_client", return_value=_FakeSfClient([])):
+            sf_dump_tool.dump_sf_query(
+                soql="SELECT Id FROM Campaign WHERE Campaign_Code__c = '2024-01-01'",
+                portco_key="fishbowl",
+                label="dl4",
+                output_dir=str(tmp_path),
+            )
+    assert "'2024-01-01'" in captured["soql"]

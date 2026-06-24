@@ -368,15 +368,21 @@ def _strip_sf_attributes(record: dict) -> dict:
     return record
 
 
-_SOQL_QUOTED_DATE_RE = _re.compile(r"'(\d{4}-\d{2}-\d{2}(?:T[\d:.+Z-]*)?)'")
+# Only unquote a date literal that follows a RELATIONAL operator (>, <, >=, <=).
+# Date columns are range-compared; a quoted date there 400s and is the bug we
+# fix. Equality (``=``) is left alone on purpose: a TEXT field can legitimately
+# hold a date-looking string (e.g. ``Campaign_Code__c = '2024-01-01'``) and
+# unquoting that would corrupt a valid filter (codex review, 2026-06-24).
+_SOQL_QUOTED_DATE_RE = _re.compile(r"([<>]=?\s*)'(\d{4}-\d{2}-\d{2}(?:T[\d:.+Z-]*)?)'")
 
 
 def _unquote_soql_date_literals(soql: str) -> str:
-    """Strip surrounding single quotes from ISO date/datetime literals in a
-    SOQL string. SOQL date literals are bare by spec; quoting them 400s. Only
-    values matching ``YYYY-MM-DD`` (optionally with a ``T...`` time part) are
-    touched — ``Status = 'Open'`` and other string literals are left intact."""
-    repaired = _SOQL_QUOTED_DATE_RE.sub(r"\1", soql)
+    """Strip surrounding single quotes from ISO date/datetime literals that are
+    range-compared in a SOQL WHERE clause. SOQL date literals are bare by spec;
+    quoting them 400s. Only ``<op> 'YYYY-MM-DD[T...]'`` (op in >, <, >=, <=) is
+    touched — equality comparisons and other string literals are left intact so
+    a text field holding a date-like value isn't corrupted."""
+    repaired = _SOQL_QUOTED_DATE_RE.sub(r"\1\2", soql)
     if repaired != soql:
         log.info("[SOQL_DATE_REPAIR] unquoted date literal(s) in SOQL")
     return repaired

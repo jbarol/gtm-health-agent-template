@@ -3108,6 +3108,37 @@ def test_sf_auth_failure_latches_session(monkeypatch):
     assert "auth" in json.dumps(out).lower()
 
 
+def test_soql_syntax_error_with_column_position_does_not_latch(monkeypatch):
+    """A malformed-SOQL error that happens to contain 'Column:401' must NOT be
+    mistaken for an HTTP 401 auth failure and latch the session (codex review)."""
+    import session_runner as sr
+    import sf_dump_tool
+
+    _reset_failure_state(sr)
+
+    def syntax_boom(*a, **k):
+        raise RuntimeError("MALFORMED_QUERY: unexpected token at Row:1:Column:401")
+
+    monkeypatch.setattr(sf_dump_tool, "dump_sf_query", syntax_boom)
+    sr._dispatch_tool(
+        "dump_sf_query",
+        {"soql": "SELECT bogus FROM Lead", "portco_key": "fishbowl", "label": "x"},
+        session_id="s-noauth",
+    )
+    # A corrected query in the same session must NOT be aborted.
+    monkeypatch.setattr(
+        sf_dump_tool, "dump_sf_query", lambda *a, **k: {"file_path": None, "count": 0}
+    )
+    out = json.loads(
+        sr._dispatch_tool(
+            "dump_sf_query",
+            {"soql": "SELECT Id FROM Lead", "portco_key": "fishbowl", "label": "y"},
+            session_id="s-noauth",
+        )
+    )
+    assert out.get("error_kind") != "auth_aborted"
+
+
 # ---------------------------------------------------------------------------
 # Task 5 (F6a): generate_chart validates data.labels before rendering. #289.
 # ---------------------------------------------------------------------------

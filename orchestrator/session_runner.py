@@ -456,7 +456,6 @@ _SF_AUTH_SIGNALS = (
     "sf_auth_failed",
     "invalid_session_id",
     "authentication failure",
-    "401",
     "insufficient_access",
 )
 _SF_TOOLS = ("dump_sf_query",)
