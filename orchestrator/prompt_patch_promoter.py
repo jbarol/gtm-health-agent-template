@@ -14,9 +14,14 @@ gap by:
   2. Parsing it into discrete blocks separated by ``## Patch — <date>`` headers.
   3. Fingerprinting each block (sha256 of normalized content).
   4. Filtering out fingerprints already in ``/system/prompt_patches_applied.md``.
-  5. Asking Sonnet 4.6 for ONE coherent unified diff against
-     ``agents/setup_agents.py`` covering all un-applied patches.
-  6. Applying the diff to a working tree, validating with ``git diff --check``.
+  5. Asking Sonnet 4.6 for a set of search/replace edits (JSON
+     ``{old_string, new_string}``) against ``agents/setup_agents.py``
+     covering all un-applied patches. (Was a unified diff until 2026-06-24
+     — LLM-authored diffs with miscounted ``@@`` hunk headers failed
+     ``git apply`` every weekly run; search/replace applies deterministically
+     in Python and cannot be corrupted by line-count drift.)
+  6. Applying the edits to the file in-process (each old_string must match
+     exactly once, else abort).
   7. Opening a draft PR via ``gh pr create``.
   8. Marking the batch's fingerprints in the applied ledger.
 
@@ -35,11 +40,10 @@ Constraints
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
-import os
 import re
 import subprocess
-import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Optional, Tuple
@@ -139,27 +143,27 @@ def promote_prompt_patches() -> Tuple[int, int, Optional[str], bool]:
         return (len(blocks), 0, None, True)
 
     try:
-        diff_text = _ask_sonnet_for_diff(pending)
+        edits = _ask_sonnet_for_edits(pending)
     except Exception:
-        log.exception("Sonnet diff request failed")
+        log.exception("Sonnet edit request failed")
         _admin_dm(
-            f"prompt-patch promoter: Sonnet diff request failed for "
+            f"prompt-patch promoter: Sonnet edit request failed for "
             f"{len(pending)} pending patches. See Railway logs."
         )
         return (len(blocks), 0, None, False)
 
-    if not diff_text or not diff_text.strip():
-        log.warning("Sonnet returned empty diff; nothing to do")
+    if not edits:
+        log.warning("Sonnet returned no usable edits; nothing to do")
         _admin_dm(
-            f"prompt-patch promoter: Sonnet returned an empty diff for "
+            f"prompt-patch promoter: Sonnet returned no usable edits for "
             f"{len(pending)} pending patches. Applied ledger NOT updated "
             f"— next run will retry."
         )
         return (len(blocks), 0, None, False)
 
-    # Apply the diff to a working tree + open the draft PR.
+    # Apply the edits to setup_agents.py + open the draft PR.
     try:
-        pr_url = _apply_diff_and_open_pr(diff_text, pending)
+        pr_url = _apply_edits_and_open_pr(edits, pending)
     except _PromoterError as e:
         log.warning("Promoter aborted: %s", e)
         _admin_dm(f"prompt-patch promoter: {e}. See Railway logs.")
@@ -172,7 +176,7 @@ def promote_prompt_patches() -> Tuple[int, int, Optional[str], bool]:
         return (len(blocks), 0, None, False)
 
     if not pr_url:
-        # _apply_diff_and_open_pr should have raised; defensive guard.
+        # _apply_edits_and_open_pr should have raised; defensive guard.
         return (len(blocks), 0, None, False)
 
     try:
@@ -367,9 +371,7 @@ _PROMOTER_SYSTEM_PROMPT = (
     "are NOT the primary target. Default to editing one of the 8 above.\n\n"
     "Each system prompt is a triple-quoted Python string literal with "
     "leading whitespace per line (the file is indented inside a "
-    "``def`` block in some places, top-level in others). Preserve the "
-    "exact indentation of the surrounding code — a unified diff that "
-    "drops leading whitespace will fail to apply and will be rejected.\n\n"
+    "``def`` block in some places, top-level in others).\n\n"
     "Patch format you'll receive (concatenated from "
     "``/system/prompt_patches.md`` in the Anthropic memory store):\n"
     "  ## Patch — <YYYY-MM-DD>\n"
@@ -386,47 +388,43 @@ _PROMOTER_SYSTEM_PROMPT = (
     "     issues go to Pipeline Monitor, opp-flow to Sales Process "
     "     Monitor, retention to Post-Sales Monitor, orchestration to "
     "     Coordinator, statistics to Statistician.\n"
-    "  4. Compose ONE unified diff against ``agents/setup_agents.py`` "
-    "     that edits the relevant system prompts. The diff must:\n"
-    "     - Start with ``--- a/agents/setup_agents.py`` and "
-    "       ``+++ b/agents/setup_agents.py`` headers.\n"
-    "     - Use standard hunk headers ``@@ -<old_start>,<old_count> "
-    "       +<new_start>,<new_count> @@``.\n"
-    "     - Preserve exact leading whitespace of the surrounding lines.\n"
-    '     - Edit ONLY the ``system="""\\n..."""`` strings, never the '
-    "       ``tools=``, ``mcp_servers=``, ``model=``, or ``name=`` "
-    "       arguments.\n"
-    "     - Never delete an existing rule that is unrelated to the "
-    "       patches you're applying — additive edits only when possible.\n"
-    "     - Group related additions under existing section headers in "
-    "       the prompt (e.g. ``## Verifying tool access``) rather than "
-    "       appending at the bottom.\n"
-    "  5. Output ONLY the unified diff. No preamble, no markdown fence, "
-    "     no trailing commentary. The orchestrator pipes your output "
-    "     directly into ``git apply``.\n\n"
-    "Output anti-patterns — your response will be REJECTED if it:\n"
-    "  - Wraps the diff in a ```diff ... ``` fence.\n"
-    "  - Includes a ``Here is the diff:`` preamble.\n"
-    "  - Edits any file other than ``agents/setup_agents.py``.\n"
-    "  - Touches ``tools=``, ``mcp_servers=``, ``model=``, or ``name=`` "
-    "    parameters.\n"
-    "  - Adds a new agent (``client.beta.agents.create(...)`` block).\n"
-    "  - Deletes a rule that no pending patch mentions.\n"
-    "  - Contains trailing whitespace or tab-vs-space inconsistencies "
-    "    relative to the surrounding code (the orchestrator runs "
-    "    ``git diff --check`` and rejects on warning).\n"
-    "  - Includes a ``--- /dev/null`` or ``new file mode`` header.\n\n"
-    "When in doubt, produce a smaller, more conservative diff. A diff that "
-    "lands two well-grounded edits is far more valuable than one that "
-    "tries to land ten and gets rejected for whitespace drift."
+    "  4. Produce a set of search/replace edits against "
+    "     ``agents/setup_agents.py``.\n\n"
+    "Output format — return ONLY a JSON array, no preamble, no markdown "
+    "fence, no trailing commentary:\n"
+    '  [{"old_string": "<exact text to find>", "new_string": '
+    '"<replacement>"}, ...]\n\n'
+    "Rules for each edit (these REPLACE the old unified-diff contract — "
+    "an LLM-authored diff with miscounted ``@@`` hunk headers was failing "
+    "``git apply`` every run; search/replace is applied deterministically "
+    "in Python and cannot be corrupted by line-count drift):\n"
+    "  - ``old_string`` MUST be copied VERBATIM from the file, including "
+    "    every leading space of indentation. Copy enough surrounding "
+    "    context that ``old_string`` appears EXACTLY ONCE in the file — "
+    "    a non-unique or not-found ``old_string`` is rejected and the "
+    "    whole run aborts.\n"
+    "  - ``new_string`` is the full replacement for that exact span, with "
+    "    the same indentation style.\n"
+    '  - Edit ONLY the ``system="""\\n..."""`` prompt strings — never the '
+    "    ``tools=``, ``mcp_servers=``, ``model=``, or ``name=`` arguments.\n"
+    "  - Additive edits only when possible: keep ``old_string`` small and "
+    "    fold the new rule into the existing text in ``new_string``. Never "
+    "    delete a rule no pending patch mentions.\n"
+    "  - Group related additions under existing section headers in the "
+    "    prompt (e.g. ``## Verifying tool access``) rather than appending "
+    "    at the bottom.\n"
+    "  - Do NOT add a new agent (``client.beta.agents.create(...)`` block).\n\n"
+    "When in doubt, produce fewer, smaller edits. Two well-grounded edits "
+    "that apply cleanly beat ten that miss their anchor and abort the run."
 )
 
 
-def _ask_sonnet_for_diff(pending: list[dict]) -> str:
-    """Ask Sonnet 4.6 for a unified diff. Returns the raw text."""
+def _ask_sonnet_for_edits(pending: list[dict]) -> list[dict]:
+    """Ask Sonnet 4.6 for search/replace edits. Returns a list of
+    ``{"old_string", "new_string"}`` dicts (empty list if none usable)."""
     user_message = (
-        f"Pending patches ({len(pending)} total). Produce ONE unified diff "
-        f"against ``agents/setup_agents.py``:\n\n"
+        f"Pending patches ({len(pending)} total). Produce search/replace "
+        f"edits against ``agents/setup_agents.py`` as a JSON array:\n\n"
         + "\n\n".join(b["content"] for b in pending)
     )
 
@@ -449,7 +447,7 @@ def _ask_sonnet_for_diff(pending: list[dict]) -> str:
         log.exception("Failed to log promoter usage (non-fatal)")
     try:
         cost_collector.track_messages_call(
-            call_site="prompt_patch_promoter._ask_sonnet_for_diff",
+            call_site="prompt_patch_promoter._ask_sonnet_for_edits",
             model=_MODEL,
             usage=response.usage,
         )
@@ -457,20 +455,49 @@ def _ask_sonnet_for_diff(pending: list[dict]) -> str:
         log.exception("Failed to persist promoter cost row (non-fatal)")
 
     text = next((b.text for b in response.content if b.type == "text"), "")
-    return _strip_fences(text)
+    return _parse_edits(text)
 
 
 def _strip_fences(text: str) -> str:
-    """Strip a leading ```diff fence if Sonnet ignores the instruction."""
+    """Strip a leading ``` fence if Sonnet ignores the no-fence instruction."""
     s = text.strip()
     if s.startswith("```"):
-        # Drop the first line (```diff or ```), and the trailing ```.
+        # Drop the first line (```json or ```), and the trailing ```.
         first_nl = s.find("\n")
         if first_nl >= 0:
             s = s[first_nl + 1 :]
         if s.rstrip().endswith("```"):
             s = s.rstrip()[:-3].rstrip()
     return s
+
+
+def _parse_edits(text: str) -> list[dict]:
+    """Parse a JSON array of ``{old_string, new_string}`` edits from the
+    model's text. Tolerant of fences and surrounding prose: extracts the
+    outermost ``[...]`` span. Returns [] if nothing parseable, and drops any
+    entry missing either key."""
+    s = _strip_fences(text)
+    start = s.find("[")
+    end = s.rfind("]")
+    if start < 0 or end <= start:
+        return []
+    try:
+        data = json.loads(s[start : end + 1])
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    edits: list[dict] = []
+    for item in data:
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("old_string"), str)
+            and isinstance(item.get("new_string"), str)
+        ):
+            edits.append(
+                {"old_string": item["old_string"], "new_string": item["new_string"]}
+            )
+    return edits
 
 
 # ---------------------------------------------------------------------------
@@ -482,14 +509,57 @@ class _PromoterError(Exception):
     """User-friendly failure mode that maps to an admin DM."""
 
 
-def _apply_diff_and_open_pr(diff_text: str, pending: list[dict]) -> str:
-    """Apply the diff in a fresh branch and open a draft PR. Returns the URL.
+def _read_setup_agents() -> str:
+    """Read agents/setup_agents.py. Thin wrapper so tests can monkeypatch."""
+    return (REPO_ROOT / SETUP_AGENTS_REL).read_text(encoding="utf-8")
+
+
+def _write_setup_agents(text: str) -> None:
+    """Write agents/setup_agents.py. Thin wrapper so tests can monkeypatch."""
+    (REPO_ROOT / SETUP_AGENTS_REL).write_text(text, encoding="utf-8")
+
+
+def _apply_edits_to_text(source: str, edits: list[dict]) -> str:
+    """Apply search/replace ``edits`` to ``source`` deterministically.
+
+    Each ``old_string`` must occur EXACTLY ONCE — zero matches means the
+    prompt text drifted, more than one means the anchor is ambiguous. Either
+    way we raise ``_PromoterError`` rather than guess, so a bad edit aborts the
+    run cleanly (and the applied ledger is left untouched for a retry). This is
+    the whole point of moving off unified diffs: the apply step can no longer
+    be corrupted by an LLM miscounting hunk line numbers.
+    """
+    updated = source
+    for i, edit in enumerate(edits, start=1):
+        old = edit.get("old_string", "")
+        new = edit.get("new_string", "")
+        if not old:
+            raise _PromoterError(
+                f"edit #{i} has an empty old_string — no anchor to locate. "
+                f"Applied ledger NOT updated."
+            )
+        count = updated.count(old)
+        if count == 0:
+            raise _PromoterError(
+                f"edit #{i} old_string not found in setup_agents.py (prompt "
+                f"text drifted). Applied ledger NOT updated — next run retries."
+            )
+        if count > 1:
+            raise _PromoterError(
+                f"edit #{i} old_string matches {count} locations — ambiguous, "
+                f"refusing to guess. Applied ledger NOT updated."
+            )
+        updated = updated.replace(old, new, 1)
+    return updated
+
+
+def _apply_edits_and_open_pr(edits: list[dict], pending: list[dict]) -> str:
+    """Apply the search/replace edits in a fresh branch and open a draft PR.
 
     Workflow:
+        edits applied to setup_agents.py in-process (deterministic)
         git checkout -b <branch>
-        git apply --check <diff>          # dry-run validate
-        git apply <diff>                  # mutate working tree
-        git diff --check                  # whitespace + conflict-marker check
+        write setup_agents.py
         git add agents/setup_agents.py
         git commit -m "[auto] ..."
         git push -u origin <branch>
@@ -501,55 +571,26 @@ def _apply_diff_and_open_pr(diff_text: str, pending: list[dict]) -> str:
     body = _pr_body(pending)
     title = _pr_title(pending)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as fh:
-        fh.write(diff_text if diff_text.endswith("\n") else diff_text + "\n")
-        diff_path = fh.name
-
-    try:
-        # 1. Branch off main.
-        _run_git(["checkout", "-b", branch])
-
-        # 2. Validate diff before mutating the tree.
-        proc = _run_subprocess(
-            ["git", "apply", "--check", diff_path],
-            cwd=str(REPO_ROOT),
-            check=False,
+    source = _read_setup_agents()
+    updated = _apply_edits_to_text(source, edits)  # raises on miss/ambiguity
+    if updated == source:
+        raise _PromoterError(
+            "edits produced no change to setup_agents.py. Applied ledger NOT updated."
         )
-        if proc.returncode != 0:
-            raise _PromoterError(
-                f"Sonnet diff failed ``git apply --check`` "
-                f"(stderr: {proc.stderr.strip()[:200]}). Applied ledger "
-                f"NOT updated — next run will retry with a fresh diff."
-            )
 
-        # 3. Apply.
-        _run_git(["apply", diff_path])
+    # 1. Branch off main, then write the mutated file.
+    _run_git(["checkout", "-b", branch])
+    _write_setup_agents(updated)
 
-        # 4. Whitespace + conflict-marker check.
-        proc = _run_subprocess(
-            ["git", "diff", "--check"], cwd=str(REPO_ROOT), check=False
-        )
-        if proc.returncode != 0:
-            raise _PromoterError(
-                f"``git diff --check`` flagged whitespace errors after "
-                f"applying Sonnet diff: {proc.stdout.strip()[:200]}. "
-                f"Applied ledger NOT updated."
-            )
+    # 2. Stage + commit.
+    _run_git(["add", SETUP_AGENTS_REL])
+    _run_git(["commit", "-m", title])
 
-        # 5. Stage + commit.
-        _run_git(["add", SETUP_AGENTS_REL])
-        _run_git(["commit", "-m", title])
+    # 3. Push.
+    _run_git(["push", "-u", "origin", branch])
 
-        # 6. Push.
-        _run_git(["push", "-u", "origin", branch])
-
-        # 7. Open draft PR via gh.
-        return _gh_pr_create(branch, title, body)
-    finally:
-        try:
-            os.unlink(diff_path)
-        except OSError:
-            pass
+    # 4. Open draft PR via gh.
+    return _gh_pr_create(branch, title, body)
 
 
 def _branch_name() -> str:
