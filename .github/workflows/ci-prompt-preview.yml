@@ -56,16 +56,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install anthropic
 
-      - name: Verify required secret
+      - name: Check for API key
+        id: secret
+        # This is a PUBLIC, forkable template. A fork without the
+        # ANTHROPIC_API_KEY secret should NOT get a perpetually-red prompt-
+        # preview check — it should skip cleanly. When the secret IS present
+        # (e.g. the canonical repo) the preview still runs as a real gate.
         run: |
           if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "::error::Missing required GitHub secret: ANTHROPIC_API_KEY"
-            echo "::error::This is the CI gate for prompt changes — it cannot proceed without the key. See docs/runbooks/managed-agents-conformance.md."
-            exit 1
+            echo "::notice::ANTHROPIC_API_KEY not set — skipping prompt preview (expected on forks without the secret). See docs/runbooks/managed-agents-conformance.md."
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ANTHROPIC_API_KEY present."
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "ANTHROPIC_API_KEY present."
 
       - name: Run prompt preview (smoke check every changed prompt)
+        if: steps.secret.outputs.has_key == 'true'
         # The base ref is read from GITHUB_BASE_REF (PR runs) or
         # defaulted to "main" (workflow_dispatch). Both are trusted
         # GitHub-managed values — not user-controlled PR content — so
